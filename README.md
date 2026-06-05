@@ -49,6 +49,12 @@ Install the following libraries via Arduino Library Manager:
 - LittleFS (included with ESP32 Arduino core)
 
 ---
+## KlippyMon Running
+
+<img width="240" height="315" alt="Progress" src="https://github.com/user-attachments/assets/e25fa739-13da-4165-ade8-73d7765d6bc9" />
+
+---
+
 
 ## Quick Start
 
