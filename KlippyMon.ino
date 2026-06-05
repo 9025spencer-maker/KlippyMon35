@@ -1,156 +1,190 @@
-#include "Settings.h"
-#include "NotoSansBold15.h"// progmem for URL requests
+#include "Settings.h"     // some basic settings (TimeZone)
+#include "Language.h"     // language you want to use
+#include "Translation.h"  // language translations
+#include "Ntfy.h"         // for push nofitications if you want them
 
-//#define FORMAT_LittleFS  // Wipe SPIFFS and all files!
-//
-#define VERSION "v2.1"
-#define hostNameCYD "KlippyMon"  // this will be the AP name you set to setup wifi
-#define CONFIG "/config.txt"     // where all the settings are stored
 
+//#define FORMAT_LittleFS  // Wipe LittleFS and all files! Disable after use.
+
+#define VERSION "v3.4"
+#define hostNameCYD "KlippyMon"
+#define CONFIG "/config.txt"
+
+// ---------------- GAUGE IDs ----------------
 #define nozzleGauge 1
 #define progressGauge 2
 #define bedGauge 3
-#define headingY 132      // used for the graph headings
-#define gaugeY 170        // used for the gauges
-#define dataY gaugeY + 6  ///
-//
-time_t printStart;  //actual total print time start to finish
-time_t printEnd;
-bool gotStartTime = false;
 
-// Use hardware SPI
-TFT_eSPI tft = TFT_eSPI();
+// ---------------- LAYOUT Y POSITIONS ----------------
 
-// setup the SDcard now
-int sd_init_flag = 0;
-SPIClass SD_SPI;  // for the graphics on the SDcard
-File root;
-//
-bool foundPrinter = false;
-String printerName = "";  // name of the printer we found
-//
+#define clockBottomY 44  // tighten clock up
+#define printerNameY 60  // tighter below clock
+#define headingY 77      // gauge headings
+#define gaugeY 112       // arc centres (moved up 16px)
+#define dataY 110        // gauge values
+#define statusZoneY 146  // status zone starts earlier
+#define graphicX 65      // re-centre: (240-110)/2
+#define graphicY 147     // graphic starts here, ends at 257
+#define endTimeY 284     // ETA/End line (257 + 4 + ~11px font)
+#define filenameY 300    // filename
+#define versionY 308     // version string
+#define statusZoneH (versionY - 16 - statusZoneY)
+#define belowClockY 44  // start of area below clock, used for fillRect clears
+#define chamberX 32     // for display a chamber temp if you have one
+#define chamberY 195    // ditto
+// ---------------- RGB LED ----------------
 #define RED_PIN 22
 #define GREEN_PIN 16
 #define BLUE_PIN 17
 
-// these are variables where the data returned from the printer query is stored
-String layerText, tempLine, printState;
-float progress, nozzleTemp, nozzleTarget, bedTemp, bedTarget, printDuration, totalDuration;
-uint16_t progressPercent;
-uint16_t lastNozzleTemp, lastBedTemp, lastProgress;  // we only update as needed
-bool greenON = true, greenOFF = false;               // for the RGB LED on the back
-
 // ---------------- DISPLAY ----------------
 #define SCREEN_W 240
 #define SCREEN_H 320
-uint8_t thePollTime = 10;  // how often to look for the printer/info
-bool enablePoll = false;   // we handle this every x seconds
-bool showSleep = false;    // show the sleeping printer
-bool showHeat = false;     // showing heat icon
-bool inPrepMode = false;   // are we getting ready
-bool showIdle = false;
-//
-// ----------- CLOCK --------------
-bool clock24 = false;  // not implemented yet
-uint8_t lastSecond = 99;
-uint8_t lastMinute;
-uint8_t lastHour;
-uint8_t lastDay;
-uint8_t lastMonth;
-uint16_t lastYear, myYear;
-uint8_t myHour, myMinute, mySecond, my24Hour, myDay, myMonth, myWeekDay, tempMonth;
-bool colonBlink = false;  // we want the colon to blink
-bool activeETA = false;
-uint16_t etaHH;
-uint16_t etaMM;
-uint8_t futureHour12, futureHour24, futureMinute;  // gives the time when the print will be done
 
-// ---------------- TIME ----------------
+TFT_eSPI tft = TFT_eSPI();
+
+// ---------------- PRINTER STATE ----------------
+bool foundPrinter = false;
+String printerName = "";
+
+String printState;
+float progress, nozzleTemp, nozzleTarget, bedTemp, bedTarget, printDuration, totalDuration;
+uint16_t progressPercent;
+uint16_t lastNozzleTemp, lastBedTemp, lastProgress;
+
+bool greenON = true;
+bool greenOFF = false;
+
+bool enablePoll = false;
+uint8_t thePollTime = 10;
+
+bool forcePoll = true;  // true at boot, true after settings update
+
+float savedTotalDuration = 0.0;  // save the total duration so it doesn't get nop'd out
+
+// ---------------- PRINTER STATE MACHINE ----------------
+typedef enum {
+  STATE_IDLE,      // standby - printer on but doing nothing
+  STATE_PREP,      // printing flag set but printDuration == 0 (heating/levelling/homing/filament)
+  STATE_PRINTING,  // printDuration > 0 - actual print in progress
+  STATE_COMPLETE   // just transitioned from PRINTING to IDLE
+} PrinterState;
+
+PrinterState currentState = STATE_IDLE;
+PrinterState lastState = STATE_IDLE;
+
+bool showSleep = false;
+bool showIdle = false;
+bool justFinished = false;
+uint32_t finishedAt = 0;
+String thePrintFileRaw;  // full untruncated path, used only for thumbnail fetch
+#define FINISHED_DISPLAY_MS 30000
+#define HTTP_CONNECT_TIMEOUT 2000   // ms - increase if on printer is on WiFi
+#define HTTP_RESPONSE_TIMEOUT 3000  // ms
+
+// ---------------- CLOCK ----------------
+uint8_t lastSecond = 99;
+uint8_t lastMinute, lastHour, lastDay, lastMonth;
+uint16_t lastYear, myYear;
+uint8_t myHour, myMinute, mySecond, my24Hour, myDay, myMonth, myWeekDay;
+bool colonBlink = false;
+bool activeETA = false;
+uint16_t etaHH, etaMM;
+
+// ---------------- NTP ----------------
 #define NTP_SERVER "pool.ntp.org"
-#define NTP_RESYNC_INTERVAL (4 * 3600)
-unsigned long lastNtpSync = 0;
 static const char ntpServerName[] = "pool.ntp.org";
 uint16_t localPort;
-uint8_t ntpUpdateFrequency = 123;  // update the time every x minutes
+uint8_t ntpUpdateFrequency = 123;
 WiFiUDP Udp;
 
-// Set web server port number to 80
+// Web server
 WebServer server(80);
 
-void handlePrinterOffLine();                                                            // draws the graphic when the printer is offline
-void printDirectory(File dir, int numTabs);                                             // just for debugging the SD card
-void drawBmp(fs::FS &fs, const char *filename, int16_t x, int16_t y);                   // display BMP files (24 bit only)
-uint16_t read16(fs::File &f);                                                           // used for reading the BMP
-uint32_t read32(fs::File &f);                                                           // used for reading the BMP
-int sd_init();                                                                          // init the SDcard
-void handle_ClockDisplay();                                                             // where most of the magic is done...
-void handlePolling(int8_t theSeconds);                                                  // how often the printer is looked for
-void handleGaugeHeadings();                                                             // shows the gauge headings only
-void handleGauge(uint8_t whichGauge, int16_t gaugeValue);                               // handles each gauge individually
-void setRGB(bool redLevel, bool greenLevel, bool blueLevel);                            // for the LED on the back of the CYD
-void handleHostName();                                                                  // searches for the printer at the IP and gets it's hostname (QIDI default would be mkspi)
-void handleTimeUsed();                                                                  // this is a running total from the time of heating to the end head park
-void handleETA();                                                                       // displays how many hrs, minutes are remaining.
-void estimateTimeRemaining(float elapsedSeconds, float percentComplete, char *result);  // calculates ETA
-void handlePrinterStatus();                                                             // when the printer is online, this sends requests to see what it's doing (standby, printing)
-void configModeCallback(WiFiManager *myWiFiManager);                                    // for displaying the access point to connect to setup wifi
-time_t getNtpTime();                                                                    // gets the time from the NTP pool
-void sendNTPpacket(IPAddress &address);                                                 // asks for the time from the NTP pool
-String SendHTML();                                                                      // web page that shows when you connect to KlippyMon with a browser
-void handlePrinterUpdate();                                                             // when you change settings in the web page, this updates things.
-String getPrinterSetup();                                                               // for the web page to display current printer settings
-void writeSettings();                                                                   // write the settings to memory
-void readSettings();                                                                    // read the settings from memory
-void buildPrinterURLs();                                                                // build the http strings to find and check the printer on the LAN
-String extractFileName(const String &path, bool withExt);                               // extract the current printing filament
-void handleWifiReset();                                                                 // reset the WIFI KlippyMon connects to
-void redirectHome();                                                                    // after a reset say bye bye to the client
-void drawGrid();                                                                        // just for working on line spacing
-//
+// ---------------- FORWARD DECLARATIONS ----------------
+void handlePrinterOffLine();
+void drawBmp(fs::FS &fs, const char *filename, int16_t x, int16_t y);
+uint16_t read16(fs::File &f);
+uint32_t read32(fs::File &f);
+void handle_ClockDisplay();
+void handlePolling(int8_t theSeconds);
+void handleGaugeHeadings();
+void handleGauge(uint8_t whichGauge, int16_t gaugeValue);
+void setRGB(bool redLevel, bool greenLevel, bool blueLevel);
+void handleHostName();
+void handleTimeUsed();
+void handleETA();
+void estimateTimeRemaining(float elapsedSeconds, float percentComplete, char *result);
+bool fetchPrinterData();
+PrinterState determinePrinterState();
+void updatePrinterDisplay(PrinterState state);
+void handlePrinterStatus();
+void configModeCallback(WiFiManager *myWiFiManager);
+time_t getNtpTime();
+void sendNTPpacket(IPAddress &address);
+String SendHTML();
+void handlePrinterUpdate();
+String getPrinterSetup();
+void writeSettings();
+void readSettings();
+void buildPrinterURLs();
+String extractFileName(const String &path, bool withExt);
+void handleWifiReset();
+void redirectHome();
+void drawWiFiQuality();
+int8_t getWifiQuality();
+void handle_OnConnect();
+void drawVersionString();
+bool fetchAndDrawThumbnail();
+int pngDraw(PNGDRAW *pDraw);
+void fetchPrinterLimits();                            // get the printers default limits
+String ntfyServerDisplay();                           // cleans up the URL for local host server
+void beginHTTP(HTTPClient &http, const String &url);  // timeouts for http
+
+// ============================================================
+//  VERSION STRING
+// ============================================================
+void drawVersionString() {
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(String(VERSION) + " @2026 - Wabbit Wanch Design", 120, versionY, 2);
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
 void handle_OnConnect() {
   server.send(200, "text/html", SendHTML());
 }
-//
+
 void setup() {
-  // put your setup code here, to run once:
   Serial.begin(115200);
 
   tft.init();
   tft.setRotation(0);
 
-// Enable if you want to erase SPIFFS, this takes some time!
-// then disable and reload sketch to avoid reformatting on every boot!
 #ifdef FORMAT_LittleFS
-  tft.setTextDatum(MC_DATUM);  // Middle Centre datum
-  tft.drawString("Formatting LittleFS, so wait!", 120, 195);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Formatting LittleFS, please wait...", 120, 160, 2);
   LittleFS.format();
-  ESP.restart();  // then reboot
+  ESP.restart();
 #endif
-  //
-  if (!LittleFS.begin(true)) {  // get the file system running
-    Serial.println("Flash FS initialization failed!");
-    while (1) yield();  // Stay here twiddling thumbs waiting
-  }
-  Serial.println("Flash FS available!");
-  //
-  SD.begin();
-  root = SD.open("/");
 
-  // and now the RGB LED on the back of the CYD
-  // Only the green is used
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS init failed!");
+    while (1) yield();
+  }
+  Serial.println("LittleFS ready.");
+
   pinMode(RED_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
   pinMode(BLUE_PIN, OUTPUT);
   setRGB(0, 0, 0);
-  //
-  //Local intialization.
+
   WiFiManager wifiManager;
-  //AP Configuration
-  wifiManager.setHostname("KlippyMon");  // sets the custom DNS name that appears in your router
+  wifiManager.setHostname("KlippyMon");
   wifiManager.setAPCallback(configModeCallback);
-  //Exit After Config Instead of connecting
   wifiManager.setBreakAfterConfig(true);
-  // --- now connect to the last Wifi point
   if (!wifiManager.autoConnect(hostNameCYD)) {
     delay(3000);
     ESP.restart();
@@ -160,55 +194,42 @@ void setup() {
     delay(500);
   }
 
-  // Seed Random With values Unique To This Device
   uint8_t macAddr[6];
   WiFi.macAddress(macAddr);
-  String ipaddress = WiFi.localIP().toString();
-  Udp.begin(localPort);  // port to use
+  Udp.begin(localPort);
   setSyncProvider(getNtpTime);
-  //Set Sync Intervals
   setSyncInterval(ntpUpdateFrequency * 60);
-  //
-  // OTA Setup
+
   WiFi.hostname(hostNameCYD);
-  MDNS.begin(hostNameCYD);  // start the MDNS server...
-  ArduinoOTA.setHostname(hostNameCYD);
-  // ArduinoOTA.setPassword((const char *)"12345");
-  ArduinoOTA.begin();
+  MDNS.begin(hostNameCYD);
 
-  // pages we allow for the web server
-  server.on("/", handle_OnConnect);                      // show a default page with all the settings
-  server.on("/updatePrinterInfo", handlePrinterUpdate);  // if updated, go extract values
-  server.on("/wifiReset", handleWifiReset);              // reset the WIFI (in the event the LAN router changes)
-  // server.on("/updateconfig", handleUpdateConfig);
-  // server.on("/updateweatherconfig", handleUpdateWeather);
-  // server.on("/configure", handleConfigure);
-  server.begin();  // and start the server
-
-  // add an MDNS so you can use KlippyMon.local instead of IP addres
+  server.on("/", handle_OnConnect);
+  server.on("/updatePrinterInfo", handlePrinterUpdate);
+  server.on("/wifiReset", handleWifiReset);
+  server.begin();
   MDNS.addService("http", "tcp", 80);
 
-  tft.fillScreen(TFT_BLACK);  // erase the TFT
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);  //
-  tft.drawString(String(VERSION) + " @2026 - Wabbit Wanch Design", 120, 310, 2);
+  tft.fillScreen(TFT_BLACK);
+  drawVersionString();
 
-  // now we read in the default settings from the settings.h portion
-  readSettings();      // go read in the default settings
-  buildPrinterURLs();  // now build the URL's from the last saved data
+  readSettings();
+  buildPrinterURLs();
 }
-//
+
+// ============================================================
+//  LOOP
+// ============================================================
 void loop() {
   static time_t prevDisplay = 0;
   timeStatus_t ts = timeStatus();
   utc = now();
+
   switch (ts) {
     case timeNeedsSync:
     case timeSet:
-      //update the schedule checking only if time has changed
       if (now() != prevDisplay) {
         prevDisplay = now();
-        handle_ClockDisplay();  // go handle the schedule if it's on
+        handle_ClockDisplay();
         tmElements_t tm;
         breakTime(now(), tm);
       }
@@ -217,39 +238,40 @@ void loop() {
       now();
       delay(3000);
   }
+
   if (enablePoll == true) {
-    if (printerName == "") {   // we need to find the printer name first
-      handleHostName();        // see if it's online yet fetch the host name
-      handlePrinterOffLine();  // handle no printer online
+    if (printerName == "") {
+      handleHostName();
+      handlePrinterOffLine();
     } else {
-      handlePrinterStatus();  // go handle the requests to the printer
-      handleETA();            // update the ETA of when it should be done
+      handlePrinterStatus();
     }
-    enablePoll = false;  // reset the polling trigger
+    enablePoll = false;
   }
-  ArduinoOTA.handle();
+
   server.handleClient();
 }
-//
-// -------- WIFI Signal Strength ---------
-//
+
+// ============================================================
+//  WIFI QUALITY BAR GRAPH
+// ============================================================
 void drawWiFiQuality() {
-  const byte numBars = 5;                      // set the number of total bars to display
-  const byte barWidth = 3;                     // set bar width, height in pixels
-  const byte barHeight = 20;                   // should be multiple of numBars, or to indicate zero value
-  const byte barSpace = 1;                     // set number of pixels between bars
-  const uint16_t barXPosBase = SCREEN_W - 25;  // set the X-pos for drawing the bars
-  const byte barYPosBase = 20;                 // set the baseline Y-pos for drawing the bars
+  const byte numBars = 5;
+  const byte barWidth = 3;
+  const byte barHeight = 20;
+  const byte barSpace = 1;
+  const uint16_t barXPosBase = SCREEN_W - 25;
+  const byte barYPosBase = 20;
   const uint16_t barColor = TFT_YELLOW;
   const uint16_t barBackColor = TFT_DARKGREY;
 
   int8_t quality = getWifiQuality();
 
-  for (int8_t i = 0; i < numBars; i++) {  // current bar loop
+  for (int8_t i = 0; i < numBars; i++) {
     byte barSpacer = i * barSpace;
     byte tempBarHeight = (barHeight / numBars) * (i + 1);
-    for (int8_t j = 0; j < tempBarHeight; j++) {  // draw bar height loop
-      for (byte ii = 0; ii < barWidth; ii++) {    // draw bar width loop
+    for (int8_t j = 0; j < tempBarHeight; j++) {
+      for (byte ii = 0; ii < barWidth; ii++) {
         byte nextBarThreshold = (i + 1) * (100 / numBars);
         byte currentBarThreshold = i * (100 / numBars);
         byte currentBarIncrements = (barHeight / numBars) * (i + 1);
@@ -271,79 +293,841 @@ void drawWiFiQuality() {
     }
   }
 }
-// converts the dBm to a range between 0 and 100%
+
 int8_t getWifiQuality() {
   int32_t dbm = WiFi.RSSI();
-  if (dbm <= -100) {
-    return 0;
-  } else if (dbm >= -50) {
-    return 100;
+  if (dbm <= -100) return 0;
+  else if (dbm >= -50) return 100;
+  else return 2 * (dbm + 100);
+}
+
+// ============================================================
+//  CLOCK DISPLAY  (WabbitWeather style, NotoSansBold36)
+// ============================================================
+void handle_ClockDisplay() {
+  char buffer[24];
+  uint8_t theHour;
+
+  time_t utc = now();
+  time_t localTime = timeZoneRule.toLocal(utc, &tcr);
+
+  myHour = hourFormat12(localTime);
+  my24Hour = hour(localTime);
+  myMinute = minute(localTime);
+  mySecond = second(localTime);
+  myDay = day(localTime);
+  myMonth = month(localTime);
+  myYear = year(localTime);
+
+  uint8_t xpos = (SCREEN_W / 2) - 1;
+
+  tft.loadFont(AA_FONT_LARGE, LittleFS);
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+
+  theHour = (show24HR) ? my24Hour : myHour;
+
+  if (colonBlink == false) {
+    sprintf(buffer, " %2u:%02u ", theHour, myMinute);
   } else {
-    return 2 * (dbm + 100);
+    sprintf(buffer, " %2u %02u ", theHour, myMinute);
+  }
+  colonBlink = !colonBlink;
+
+  tft.setTextPadding(tft.textWidth(" 44:44 "));
+  tft.drawString(buffer, xpos, clockBottomY);
+  tft.setTextPadding(0);
+  tft.unloadFont();
+
+  // Save for next pass
+  lastSecond = mySecond;
+  lastMinute = myMinute;
+  lastHour = my24Hour;
+  lastDay = myDay;
+  lastYear = myYear;
+  lastMonth = myMonth;
+
+  handlePolling(mySecond);
+
+  if (mySecond == (thePollTime + 5)) {
+    drawWiFiQuality();
   }
 }
-//
-void handlePrinterOffLine() {
-  if (printerName == "") {                                          // draw the sleeping printer
-    if (showSleep == false) {                                       // we only show the printer graphic ONCE
-      tft.fillRect(0, 100, 239, 198, TFT_BLACK);                    // clear the area
-      drawBmp(SD, OFFLINE_IMAGE, 27, 100);                          //display sleeping printer
-      String ipaddress = "KlippyMon " + WiFi.localIP().toString();  // get my IP address
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);                       // white text
-      tft.setTextDatum(BC_DATUM);
-      tft.drawString(ipaddress, 120, 294, 2);  // show the IP address of KlippyMon
-      showSleep = true;                        // only show it once...
-    }
-  } else {                                     // the printer is AWAKE!
-    tft.fillRect(0, 76, 239, 220, TFT_BLACK);  // get rid of anything there it won't be back here.
-    uint8_t xpos = (SCREEN_W / 2) - 1;
-    uint8_t ypos = 106;
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);  // Now show the printer name
-    tft.setTextDatum(BC_DATUM);
-    tft.drawString(printerName, xpos, ypos, 4);  // show the name
-    handleGaugeHeadings();                       // show the headings
-    handlePrinterStatus();                       // go handle the requests to the printer
+
+// ============================================================
+//  POLLING TRIGGER
+// ============================================================
+void handlePolling(int8_t theSeconds) {
+  if (forcePoll) {
+    enablePoll = true;
+    forcePoll = false;  // clear it, back to normal timer polling
+    return;
+  }
+  if ((theSeconds % thePollTime) == 0) {
+    enablePoll = true;
   }
 }
-//
-// ---------------- BMP DRAW ----------------
-void printDirectory(File dir, int numTabs) {
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) {
-      // no more files
+
+// ============================================================
+//  GAUGE HEADINGS
+// ============================================================
+void handleGaugeHeadings() {
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(BC_DATUM);
+  tft.drawString(strNozzle, 40, headingY, 2);
+  tft.drawString(strProgress, 120, headingY, 2);
+  tft.drawString(strBed, 200, headingY, 2);
+}
+
+// ============================================================
+//  GAUGE DRAW
+// ============================================================
+void handleGauge(uint8_t whichGauge, int16_t gaugeValue) {
+  float temp;
+  uint16_t theMove;
+  tft.setTextDatum(MC_DATUM);
+
+  switch (whichGauge) {
+    case nozzleGauge:
+      temp = (float(gaugeValue) / maxNozzleTemp);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      tft.fillCircle(40, gaugeY, 20, TFT_BLACK);
+      tft.setTextColor((nozzleTarget != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), 40, dataY, 2);
       break;
-    }
-    for (uint8_t i = 0; i < numTabs; i++) {
-      Serial.print('\t');
-    }
-    Serial.print(entry.name());
-    if (entry.isDirectory()) {
-      Serial.println("/");
-      printDirectory(entry, numTabs + 1);
-    } else {
-      // files have sizes, directories do not
-      Serial.print("\t\t");
-      Serial.println(entry.size(), DEC);
-    }
-    entry.close();
+
+    case progressGauge:
+      temp = (float(gaugeValue) / 100);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (theMove > 40) {
+        tft.drawSmoothArc(120, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      }
+      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue) + "%", 120, dataY, 2);
+      break;
+
+    case bedGauge:
+      temp = (float(gaugeValue) / maxBedTemp);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      tft.fillCircle(200, gaugeY, 20, TFT_BLACK);
+      tft.setTextColor((bedTarget != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), 200, dataY, 2);
+      break;
   }
 }
-//
+
+// ============================================================
+//  RGB LED
+// ============================================================
+void setRGB(bool redLevel, bool greenLevel, bool blueLevel) {
+  digitalWrite(RED_PIN, !redLevel);
+  digitalWrite(GREEN_PIN, !greenLevel);
+  digitalWrite(BLUE_PIN, !blueLevel);
+}
+
+// ============================================================
+//  PRINTER OFFLINE SCREEN
+// ============================================================
+void handlePrinterOffLine() {
+  if (printerName == "") {
+    if (showSleep == false) {
+      tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
+      drawBmp(LittleFS, OFFLINE_IMAGE, 27, belowClockY + 4);
+      String ipaddress = "KlippyMon " + WiFi.localIP().toString();
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextDatum(BC_DATUM);
+      tft.drawString(ipaddress, 120, versionY - 16, 2);
+      drawVersionString();  // programmer info
+      showSleep = true;
+    }
+  } else {
+    tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
+    tft.loadFont(AA_FONT_SMALL, LittleFS);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.setTextDatum(BC_DATUM);
+    tft.drawString(printerName, 120, printerNameY);
+    tft.unloadFont();
+    handleGaugeHeadings();
+    handlePrinterStatus();
+    drawVersionString();
+  }
+}
+
+// ============================================================
+//  HTTP HELPER
+// ============================================================
+void beginHTTP(HTTPClient &http, const String &url) {
+  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT);
+  http.setTimeout(HTTP_RESPONSE_TIMEOUT);
+  http.begin(url);
+}
+
+// ============================================================
+//  FIND PRINTER HOSTNAME
+// ============================================================
+void handleHostName() {
+  if (WiFi.status() == WL_CONNECTED) {
+    setRGB(0, greenON, 0);
+    HTTPClient http;
+    beginHTTP(http, printerURLInfo);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      if (!error) {
+        printerName = doc["result"]["hostname"] | "";
+        Serial.println(printerName);
+      }
+    }
+    http.end();
+    setRGB(0, greenOFF, 0);
+    if (printerName != "") {
+      fetchPrinterLimits();
+      buildPrinterURLs();
+      lastBedTemp = 0;
+      lastNozzleTemp = 0;
+      lastProgress = 0;
+    }
+  }
+}
+
+// ============================================================
+//  PHASE 1 — FETCH & PARSE
+// ============================================================
+bool fetchPrinterData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost");
+    return false;
+  }
+  setRGB(0, greenON, 0);
+  HTTPClient http;
+  beginHTTP(http, printerURLQ);
+  int httpCode = http.GET();
+
+  if (httpCode != 200) {
+    http.end();
+    setRGB(0, greenOFF, 0);
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  setRGB(0, greenOFF, 0);
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if (error) {
+    Serial.println("JSON Error");
+    return false;
+  }
+
+  nozzleTarget = doc["result"]["status"]["extruder"]["target"] | 0.0;
+  bedTarget = doc["result"]["status"]["heater_bed"]["target"] | 0.0;
+  printState = doc["result"]["status"]["print_stats"]["state"] | "unknown";
+  nozzleTemp = doc["result"]["status"]["extruder"]["temperature"] | 0.0;
+  bedTemp = doc["result"]["status"]["heater_bed"]["temperature"] | 0.0;
+  printDuration = doc["result"]["status"]["print_stats"]["print_duration"] | 0.0;
+  totalDuration = doc["result"]["status"]["print_stats"]["total_duration"] | 0.0;
+  if (totalDuration > 0) savedTotalDuration = totalDuration;
+  progress = doc["result"]["status"]["display_status"]["progress"] | 0.0;
+
+  if (thePrintFile == "" && printState != "standby") {
+    String rawPath = doc["result"]["status"]["print_stats"]["filename"] | "";
+    if (rawPath != "") {
+      thePrintFileRaw = rawPath;
+      thePrintFile = extractFileName(rawPath, false);
+    }
+  }
+
+  if (hasChamber) {
+    chamberTemp = doc["result"]["status"][chamberSensorName.c_str()]["temperature"] | 0.0;
+    chamberTarget = doc["result"]["status"][chamberSensorName.c_str()]["target"] | 0.0;
+  }
+
+  return true;
+}
+
+// ============================================================
+//  FETCH PRINTER TEMP LIMITS FROM KLIPPER CONFIG
+// ============================================================
+void fetchPrinterLimits() {
+  HTTPClient http;
+  beginHTTP(http, "http://" + printerIP + ":" + printerPort + "/printer/objects/query?configfile");
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      String nozzle = doc["result"]["status"]["configfile"]["config"]["extruder"]["max_temp"] | "350";
+      String bed = doc["result"]["status"]["configfile"]["config"]["heater_bed"]["max_temp"] | "120";
+      maxNozzleTemp = nozzle.toInt();
+      maxBedTemp = bed.toInt();
+      writeSettings();
+    } else {
+      Serial.println("fetchPrinterLimits JSON error");
+    }
+  } else {
+    Serial.printf("fetchPrinterLimits failed: %d\n", httpCode);
+  }
+  http.end();
+
+  // ── Chamber detection ─────────────────────────────────────
+  beginHTTP(http, "http://" + printerIP + ":" + printerPort + "/printer/objects/list");
+  httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (!error) {
+      hasChamber = false;
+      chamberSensorName = "";
+      JsonArray objects = doc["result"]["objects"].as<JsonArray>();
+      for (JsonVariant obj : objects) {
+        String name = obj.as<String>();
+        if (name == "heater_generic hot" || name == "heater_generic chamber" || name == "heater_generic Chamber" || name == "temperature_sensor chamber" || name == "temperature_sensor Chamber" || name == "temperature_sensor chamber_temp") {
+          chamberSensorName = name;
+          hasChamber = true;
+          break;
+        }
+      }
+    }
+  }
+  http.end();
+}
+
+// ============================================================
+//  TOTAL TIME USED (shown at print end)
+// ============================================================
+void handleTimeUsed() {
+  char buffer[30];
+  int32_t totalSecs = (int32_t)savedTotalDuration;
+  int hrs = totalSecs / 3600;
+  int mins = (totalSecs % 3600) / 60;
+
+  tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+  drawBmp(LittleFS, SUCCESS_IMAGE, graphicX, graphicY);
+
+  tft.loadFont(AA_FONT_SMALL, LittleFS);
+  tft.setTextDatum(BC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  if (hrs != 0) {
+    sprintf(buffer, "%s: %1u:%02u %s", strTotal, hrs, mins, strHrs);
+  } else {
+    sprintf(buffer, "%s: %u %s", strTotal, mins, strMins);
+  }
+  tft.drawString(buffer, 120, endTimeY);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString(thePrintFile, 120, filenameY);
+  tft.unloadFont();
+
+  justFinished = true;
+  showIdle = true;
+}
+
+// ============================================================
+//  ESTIMATE TIME REMAINING
+// ============================================================
+void estimateTimeRemaining(float elapsedSeconds, float percentComplete, char *result) {
+  if (percentComplete <= 0.0f || percentComplete > 100.0f) {
+    snprintf(result, 16, "--:--");
+    return;
+  }
+  float totalEstimated = elapsedSeconds / (percentComplete / 100.0f);
+  float remainingSeconds = totalEstimated - elapsedSeconds;
+  if (remainingSeconds < 0) remainingSeconds = 0;
+
+  unsigned long remaining = (unsigned long)remainingSeconds;
+  etaHH = remaining / 3600;
+  etaMM = (remaining % 3600) / 60;
+  snprintf(result, 16, "%02u:%02u", etaHH, etaMM);
+}
+
+// ============================================================
+//  ETA
+// ============================================================
+void handleETA() {
+  if (currentState != STATE_PRINTING) {
+    activeETA = false;
+    return;
+  }
+  char timeLeft[24];
+  uint16_t pct = uint16_t(progress * 100);
+  if (pct > lastProgress) {
+    lastProgress = pct;
+    estimateTimeRemaining(printDuration, pct, timeLeft);
+
+    // Build the end time string
+    time_t utc = now();
+    time_t localTime = timeZoneRule.toLocal(utc, &tcr);
+    time_t addSeconds = ((time_t)etaHH * 3600) + ((time_t)etaMM * 60);
+    time_t futureTime = localTime + addSeconds;
+    uint8_t theHour = (show24HR) ? hour(futureTime) : hourFormat12(futureTime);
+    uint8_t theMinute = minute(futureTime);
+    bool nextDay = (hour(futureTime) < hour(localTime) && etaHH > 0);
+
+    char endStr[50];
+
+    if (!show24HR) {
+      const char *ampm = (hour(futureTime) >= 12) ? "PM" : "AM";
+      if (nextDay) {
+        sprintf(endStr, "ETA: %s  -  FPT: %u:%02u %s", timeLeft, theHour, theMinute, ampm);
+      } else {
+        sprintf(endStr, "ETA: %s  -  FPT: %u:%02u %s", timeLeft, theHour, theMinute, ampm);
+      }
+    } else {
+      sprintf(endStr, "ETA: %s  -  FPT: %u:%02u", timeLeft, theHour, theMinute);
+    }
+
+    tft.loadFont(AA_FONT_SMALL, LittleFS);
+    tft.setTextDatum(BC_DATUM);
+    tft.fillRect(0, endTimeY - 16, 239, 18, TFT_BLACK);
+
+    if (nextDay) {
+      // Draw ETA part in white
+      char etaPart[40];
+      sprintf(etaPart, "ETA: %s  -  FPT: ", timeLeft);
+      char endPart[16];
+      if (!show24HR) {
+        const char *ampm = (hour(futureTime) >= 12) ? "PM" : "AM";
+        sprintf(endPart, "%u:%02u %s", theHour, theMinute, ampm);
+      } else {
+        sprintf(endPart, "%u:%02u", theHour, theMinute);
+      }
+      // Measure ETA part width to position End part
+      int16_t etaWidth = tft.textWidth(etaPart);
+      int16_t totalWidth = etaWidth + tft.textWidth(endPart);
+      int16_t startX = 120 - (totalWidth / 2);
+      tft.setTextDatum(BL_DATUM);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(etaPart, startX, endTimeY);
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString(endPart, startX + etaWidth, endTimeY);
+    } else {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(endStr, 120, endTimeY);
+    }
+
+    tft.unloadFont();
+    activeETA = true;
+  }
+}
+// ============================================================
+//  PHASE 2 — DETERMINE STATE
+// ============================================================
+PrinterState determinePrinterState() {
+  lastState = currentState;
+
+  if (printState == "standby") {
+    if (lastState == STATE_PRINTING || lastState == STATE_PREP) {
+      return STATE_COMPLETE;
+    }
+    return STATE_IDLE;
+  }
+
+  if (printDuration == 0.0) {
+    return STATE_PREP;
+  }
+
+  return STATE_PRINTING;
+}
+
+// ============================================================
+//  PHASE 3 — UPDATE DISPLAY
+// ============================================================
+void updatePrinterDisplay(PrinterState state) {
+  tft.setTextDatum(MC_DATUM);
+
+  // Always update temperature gauges
+  if (round(nozzleTemp) != lastNozzleTemp) {
+    lastNozzleTemp = round(nozzleTemp);
+    handleGauge(nozzleGauge, lastNozzleTemp);
+  }
+  if (round(bedTemp) != lastBedTemp) {
+    lastBedTemp = round(bedTemp);
+    handleGauge(bedGauge, lastBedTemp);
+  }
+
+  switch (state) {
+
+    case STATE_IDLE:
+      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(strIdle, 120, dataY, 2);
+      if (!showIdle && !justFinished) {
+        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+        drawBmp(LittleFS, IDLE_IMAGE, graphicX + 7, graphicY + 7);
+        // ──  (fake data for layout test goes here) ──
+        showIdle = true;
+      }
+      activeETA = false;
+      break;
+
+    case STATE_PREP:
+      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawString(strPrep, 120, dataY, 2);
+      if (!showIdle) {
+        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+        drawBmp(LittleFS, HEATING_IMAGE, graphicX, graphicY);
+        showIdle = true;
+      }
+      activeETA = false;
+      break;
+
+    case STATE_PRINTING:
+      showIdle = false;
+      justFinished = false;
+      // Serial.println("STATE_PRINTING - lastState: " + String(lastState) + " thePrintFile: " + thePrintFile);
+      if (thePrintFile != "" && lastState != STATE_PRINTING) {
+        // Serial.println("Thumbnail block firing - lastState: " + String(lastState));
+        // Serial.println("thePrintFile on reconnect: " + thePrintFile);
+        ntfyResetForNewPrint();
+        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+        if (!fetchAndDrawThumbnail()) {
+          drawBmp(LittleFS, PRINTING_IMAGE, graphicX + 7, graphicY + 7);
+        }
+        tft.loadFont(AA_FONT_SMALL, LittleFS);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.setTextDatum(BC_DATUM);
+        tft.fillRect(0, filenameY - 14, 239, 16, TFT_BLACK);  // clear filename line
+        tft.drawString(thePrintFile, 120, filenameY);
+        tft.unloadFont();
+        handleGauge(progressGauge, 0);  // ← start at 0% immediately
+        lastProgress = 0;               // ← force redraw on first real progress
+      }
+
+      progressPercent = uint16_t(progress * 100.0);
+      if (progressPercent != lastProgress) {
+        lastProgress = progressPercent;
+        handleGauge(progressGauge, lastProgress);
+      }
+      ntfyCheckStall(progress);  // was progressPercent
+
+      // ── Chamber temp ──────────────────────────────────────
+      if (hasChamber) {
+        tft.loadFont(AA_FONT_SMALL, LittleFS);
+        tft.setTextDatum(MC_DATUM);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawString("CHMBR", chamberX, chamberY);
+        tft.fillRect(0, chamberY + 6, 63, 18, TFT_BLACK);  // clear number line only
+        tft.setTextColor((chamberTarget > 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+        tft.drawString(String((int)chamberTemp) + "C", chamberX, chamberY + 18);
+        tft.unloadFont();
+      }
+      break;
+
+    case STATE_COMPLETE:
+      lastProgress = 0;
+      handleGauge(progressGauge, 0);
+
+      if (thePrintFile != "") {
+        ntfyPrintComplete(thePrintFileRaw, savedTotalDuration);  // send notification
+        tft.fillRect(0, filenameY - 14, 239, 16, TFT_BLACK);
+        handleTimeUsed();
+      }
+      thePrintFile = "";
+      showIdle = true;
+      activeETA = false;
+      break;
+  }
+}
+
+// ============================================================
+//  handlePrinterStatus
+// ============================================================
+void handlePrinterStatus() {
+  static uint8_t failCount = 0;
+
+  if (!fetchPrinterData()) {
+    failCount++;
+    Serial.println("fetchPrinterData failed - count: " + String(failCount));
+    if (failCount >= 3) {  // 3 consecutive failures (~30 seconds) before giving up
+      failCount = 0;
+      printerName = "";
+      tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
+      drawVersionString();
+      showSleep = false;
+      showIdle = false;
+    }
+    return;
+  }
+
+  failCount = 0;  // reset on success
+  currentState = determinePrinterState();
+  updatePrinterDisplay(currentState);
+  handleETA();
+}
+
+// ============================================================
+//  WIFI CONFIG AP SCREEN
+// ============================================================
+void configModeCallback(WiFiManager *myWiFiManager) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString(String(hostNameCYD), SCREEN_W / 2, SCREEN_H / 2, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.loadFont(AA_FONT_SMALL, LittleFS);
+  tft.drawString("Access Point Active", SCREEN_W / 2, (SCREEN_H / 2) + 36, 2);
+  tft.unloadFont();
+  delay(2000);
+}
+
+// ============================================================
+//  NTP
+// ============================================================
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+
+time_t getNtpTime() {
+  IPAddress timeServerIP;
+  while (Udp.parsePacket() > 0)
+    ;
+  WiFi.hostByName(ntpServerName, timeServerIP);
+  sendNTPpacket(timeServerIP);
+  uint32_t beginWait = millis();
+  while ((millis() - beginWait) < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);
+      unsigned long secsSince1900;
+      secsSince1900 = (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL;
+    }
+  }
+  return 0;
+}
+
+void sendNTPpacket(IPAddress &address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  Udp.beginPacket(address, 123);
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+String ntfyServerDisplay() {
+  String s = ntfyServer;
+  s.replace("https://", "");
+  s.replace("http://", "");
+  // Strip port if present
+  int colonIdx = s.lastIndexOf(':');
+  if (colonIdx > 0) s = s.substring(0, colonIdx);
+  return s;
+}
+
+// ============================================================
+//  WEB PAGE — dark theme
+// ============================================================
+String SendHTML() {
+  String page = String(HTML_TEMPLATE);
+
+  // Header
+  page.replace("%VERSION%",           String(VERSION));
+  page.replace("%WIFI_QUALITY%",      String(getWifiQuality()));
+
+  // WiFi reset modal
+  page.replace("%WIFI_RESET_TITLE%",  String(wcWifiResetTitle));
+  page.replace("%WIFI_RESET_BODY%",   String(wcWifiResetBody));
+  page.replace("%WIFI_RESET_YES%",    String(wcWifiResetYes));
+  page.replace("%WIFI_RESET_CANCEL%", String(wcWifiResetCancel));
+  page.replace("%WIFI_RESET_BTN%",    String(wcWifiResetBtn));
+
+  // Section headings
+  page.replace("%SEC_PRINTER%",       String(wcSecPrinter));
+  page.replace("%SEC_NTFY%",          String(wcSecNtfy));
+  page.replace("%SEC_WIFI%",          String(wcSecWifi));
+
+  // Printer setup block
+  page.replace("%PRINTER_SETUP%",     getPrinterSetup());
+
+  // Ntfy labels
+  page.replace("%NTFY_ENABLED%",      String(wcNtfyEnabled));
+  page.replace("%NTFY_SERVER%",       String(wcNtfyServer));
+  page.replace("%NTFY_PORT%",         String(wcNtfyPort));
+  page.replace("%NTFY_TOPIC%",        String(wcNtfyTopic));
+  page.replace("%NTFY_TOKEN%",        String(wcNtfyToken));
+  page.replace("%NTFY_STALL_MIN%",    String(wcNtfyStallMin));
+
+  // Ntfy values
+  page.replace("%NTFY_ENABLED_CHECKED%", ntfyEnabled ? " checked" : "");
+  page.replace("%NTFY_SERVER_VAL%",   ntfyServerDisplay());
+  page.replace("%NTFY_PORT_VAL%",     ntfyPort);
+  page.replace("%NTFY_TOPIC_VAL%",    ntfyTopic);
+  page.replace("%NTFY_TOKEN_VAL%",    ntfyToken);
+  page.replace("%NTFY_STALL_MIN_VAL%", String(ntfyStallMin));
+
+  // Save button
+  page.replace("%SAVE_BTN%",          String(wcSaveBtn));
+
+  return page;
+}
+
+void handlePrinterUpdate() {
+  if (server.hasArg("printerIP")) printerIP = server.arg("printerIP");
+  if (server.hasArg("printerPort")) printerPort = server.arg("printerPort");
+  show24HR = server.hasArg("show24HR");
+  ntfyEnabled = server.hasArg("ntfyEnabled");
+  if (server.hasArg("ntfyServer")) {
+    ntfyServer = server.arg("ntfyServer");
+    ntfyServer.trim();
+  }
+  if (server.hasArg("ntfyPort")) {
+    ntfyPort = server.arg("ntfyPort");
+    ntfyPort.trim();
+  }
+  if (server.hasArg("ntfyTopic")) {
+    ntfyTopic = server.arg("ntfyTopic");
+    ntfyTopic.trim();
+  }
+  if (server.hasArg("ntfyToken")) {
+    ntfyToken = server.arg("ntfyToken");
+    ntfyToken.trim();
+  }
+  if (server.hasArg("ntfyStallMin")) ntfyStallMin = server.arg("ntfyStallMin").toInt();
+
+  // Build the full ntfy URL
+  if (!ntfyServer.startsWith("http://") && !ntfyServer.startsWith("https://")) {
+    bool isIP = true;
+    for (char c : ntfyServer) {
+      if (!isDigit(c) && c != '.') {
+        isIP = false;
+        break;
+      }
+    }
+    ntfyServer = isIP ? "http://" + ntfyServer + ":" + ntfyPort
+                      : "https://" + ntfyServer;
+  }
+
+  writeSettings();  // ← everything is set before we save
+
+  // Reset display
+  tft.fillRect(0, clockBottomY, 239, SCREEN_H - clockBottomY, TFT_BLACK);
+  drawVersionString();
+  printerName = "";
+  showSleep = false;
+  showIdle = false;
+  justFinished = false;
+  currentState = STATE_IDLE;
+  lastState = STATE_IDLE;
+  forcePoll = true;
+  buildPrinterURLs();
+  server.send(200, "text/html", SendHTML());
+}
+
+String getPrinterSetup() {
+  String printerForm = String(printer_Info);
+  printerForm.replace("%IP%", printerIP);
+  printerForm.replace("%PORT%", printerPort);
+  printerForm.replace("%boxState%", show24HR ? "checked" : "unchecked");
+  return printerForm;
+}
+
+void writeSettings() {
+  File f = LittleFS.open(CONFIG, "w");
+  if (!f) {
+    Serial.println("Settings write failed!");
+    return;
+  }
+  f.println("printerIP=" + printerIP);
+  f.println("printerPort=" + printerPort);
+  f.println("show24HR=" + String(show24HR));
+  f.println("ntfyPort=" + ntfyPort);  // write the port number if there is one
+  f.println("ntfyEnabled=" + String(ntfyEnabled));
+  f.println("ntfyServer=" + ntfyServer);
+  f.println("ntfyTopic=" + ntfyTopic);
+  f.println("ntfyToken=" + ntfyToken);
+  f.println("ntfyStallMin=" + String(ntfyStallMin));
+  f.close();
+}
+
+void readSettings() {
+  if (!LittleFS.exists(CONFIG)) {
+    writeSettings();
+    return;
+  }
+  File fr = LittleFS.open(CONFIG, "r");
+  String line;
+  while (fr.available()) {
+    line = fr.readStringUntil('\n');
+    if (line.indexOf("printerIP=") >= 0) {
+      printerIP = line.substring(10);
+      printerIP.trim();
+    }
+    if (line.indexOf("printerPort=") >= 0) {
+      printerPort = line.substring(12);
+      printerPort.trim();
+    }
+    if (line.indexOf("show24HR=") >= 0) show24HR = line.substring(9).toInt();
+    if (line.indexOf("ntfyPort=") >= 0) {
+      ntfyPort = line.substring(9);
+      ntfyPort.trim();
+    };  // read custom port local host
+    if (line.indexOf("ntfyEnabled=") >= 0) ntfyEnabled = line.substring(12).toInt();
+    if (line.indexOf("ntfyServer=") >= 0) {
+      ntfyServer = line.substring(11);
+      ntfyServer.trim();
+    }
+    if (line.indexOf("ntfyTopic=") >= 0) {
+      ntfyTopic = line.substring(10);
+      ntfyTopic.trim();
+    }
+    if (line.indexOf("ntfyToken=") >= 0) {
+      ntfyToken = line.substring(10);
+      ntfyToken.trim();
+    }
+    if (line.indexOf("ntfyStallMin=") >= 0) ntfyStallMin = line.substring(13).toInt();
+  }
+  fr.close();
+}
+
+void buildPrinterURLs() {
+  printerURLInfo = "http://" + printerIP + ":" + printerPort + printerINFO;
+  printerURLQ = "http://" + printerIP + ":" + printerPort + printQuery;
+  if (hasChamber) {
+    String encodedName = chamberSensorName;
+    encodedName.replace(" ", "+");
+    printerURLQ += "&" + encodedName;
+  }
+  // Serial.println("buildPrinterURLs hasChamber: " + String(hasChamber));
+  // Serial.println("printerURLQ: " + printerURLQ);
+}
+
+// ============================================================
+//  BMP DRAW FROM LittleFS
+// ============================================================
 void drawBmp(fs::FS &fs, const char *filename, int16_t x, int16_t y) {
   if ((x >= tft.width()) || (y >= tft.height())) return;
 
-  // Open requested file on SD card
   File bmpFS = fs.open(filename, "r");
   if (!bmpFS) {
-    Serial.print("File not found");
-    digitalWrite(SD_CS, HIGH);  // Always release
-    SPI.endTransaction();       // Release HSPI bus
+    Serial.print("BMP not found: ");
+    Serial.println(filename);
     return;
   }
 
   uint32_t seekOffset;
-  uint16_t w, h, row;  //, col;
+  uint16_t w, h, row;
   uint8_t r, g, b;
 
   if (read16(bmpFS) == 0x4D42) {
@@ -356,7 +1140,6 @@ void drawBmp(fs::FS &fs, const char *filename, int16_t x, int16_t y) {
 
     if ((read16(bmpFS) == 1) && (read16(bmpFS) == 24) && (read32(bmpFS) == 0)) {
       y += h - 1;
-
       bool oldSwapBytes = tft.getSwapBytes();
       tft.setSwapBytes(true);
       bmpFS.seek(seekOffset);
@@ -365,632 +1148,78 @@ void drawBmp(fs::FS &fs, const char *filename, int16_t x, int16_t y) {
       uint8_t lineBuffer[w * 3 + padding];
 
       for (row = 0; row < h; row++) {
-
         bmpFS.read(lineBuffer, sizeof(lineBuffer));
         uint8_t *bptr = lineBuffer;
         uint16_t *tptr = (uint16_t *)lineBuffer;
-        // Convert 24 to 16-bit colours
         for (uint16_t col = 0; col < w; col++) {
           b = *bptr++;
           g = *bptr++;
           r = *bptr++;
           *tptr++ = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
         }
-
-        // Push the pixel row to screen, pushImage will crop the line if needed
-        // y is decremented as the BMP image is drawn bottom up
         tft.pushImage(x, y--, w, 1, (uint16_t *)lineBuffer);
       }
       tft.setSwapBytes(oldSwapBytes);
-      // Serial.print("Loaded in ");
-      // Serial.print(millis() - startTime);
-      // Serial.println(" ms");
-    } else Serial.println("BMP format not recognized.");
+    } else {
+      Serial.println("BMP must be 24-bit uncompressed.");
+    }
   }
   bmpFS.close();
 }
 
-// These read 16- and 32-bit types from the SD card file.
-// BMP data is stored little-endian, Arduino is little-endian too.
-// May need to reverse subscript order if porting elsewhere.
-
 uint16_t read16(fs::File &f) {
   uint16_t result;
-  ((uint8_t *)&result)[0] = f.read();  // LSB
-  ((uint8_t *)&result)[1] = f.read();  // MSB
+  ((uint8_t *)&result)[0] = f.read();
+  ((uint8_t *)&result)[1] = f.read();
   return result;
 }
 
 uint32_t read32(fs::File &f) {
   uint32_t result;
-  ((uint8_t *)&result)[0] = f.read();  // LSB
+  ((uint8_t *)&result)[0] = f.read();
   ((uint8_t *)&result)[1] = f.read();
   ((uint8_t *)&result)[2] = f.read();
-  ((uint8_t *)&result)[3] = f.read();  // MSB
+  ((uint8_t *)&result)[3] = f.read();
   return result;
 }
-//
-int sd_init() {
-  SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  if (!SD.begin(SD_CS, SD_SPI, 40000000)) {
-    Serial.println("Card Mount Failed");
-    return 1;
-  } else {
-    Serial.println("Card Mount Successed");
-  }
-  // listDir(SD, "/", 0);
-  // Serial.println("TF Card init over.");
-  sd_init_flag = 1;
-  return 0;
-}
-//
-void handle_ClockDisplay() {
-  tmElements_t tm;
-  breakTime(now(), tm);
-  char buffer[24];  // holds the formated time/day/date
-  uint8_t theHour;  // either 12/24hr format
-  //
 
-  // --- Current local time ---
-  time_t utc = now();
-  time_t localTime = timeZoneRule.toLocal(utc, &tcr);
-
-  myHour = hourFormat12(localTime);
-  myDay = day(localTime);
-  my24Hour = hour(localTime);    // 24-hour clock
-  myMinute = minute(localTime);  // use localTime
-  mySecond = second(localTime);  // use localTime
-  myYear = year(localTime);
-  myMonth = month(localTime);  // 1 to 12
-                               //
-  // now we draw the time and the date
-  uint8_t xpos = (SCREEN_W / 2) - 1;
-  uint8_t ypos = 71;
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);  // Now show the clock time
-  tft.setTextDatum(BC_DATUM);
-  if (show24HR == true) {
-    theHour = my24Hour;  // we show this one
-  } else {
-    theHour = myHour;  // typical 12hr display
-  }
-  if (colonBlink == false) {
-    sprintf(buffer, " %2u:%02u ", theHour, myMinute);  // kill the leading 0 on the hours
-  } else {
-    sprintf(buffer, " %2u %02u ", theHour, myMinute);  // kill the leading 0 on the hours
-  }
-  colonBlink = !colonBlink;               // toggle the value for next pass
-  tft.drawString(buffer, xpos, ypos, 7);  // Overwrite the text to clear it
-  tft.setTextPadding(0);                  // Reset padding width to none
-  handlePolling(mySecond);                // go check for a trigger
-  if (mySecond == (thePollTime + 5)) {    // don't check the same time as the printer
-    drawWiFiQuality();                    // draw the wifi strength
-  }
-  //
-  lastSecond = mySecond;             // save it for next time
-  lastMinute = myMinute;             // save this for the next pass
-  lastHour = my24Hour;               // save for the next pass
-  lastDay = myDay;                   // save the day...
-  lastYear = myYear;                 // save the last year we checked
-  lastMonth = myMonth;               // save it
-  if (activeETA) {                   // do we have an print end ETA established
-    if (etaHH != 0 || etaMM != 0) {  // even if we do, is it still zero, skip if it is
-      time_t addSeconds = ((time_t)etaHH * 3600) + ((time_t)etaMM * 60);
-      // --- Future time: current + offset ---
-      time_t futureTime = localTime + addSeconds;  // gives the time when the print will be done
-      futureHour12 = hourFormat12(futureTime);
-      futureHour24 = hour(futureTime);
-      futureMinute = minute(futureTime);
-      if (show24HR == true) {
-        theHour = futureHour24;  // we show this one
-      } else {
-        theHour = futureHour12;  // typical 12hr display
-      }
-      sprintf(buffer, "End Time: %2u:%02u ", theHour, futureMinute);  // time when print will be done
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);                         // white text
-      tft.fillRect(1, 242, 239, 26, TFT_BLACK);                       // remove the old ETA first
-      tft.drawString(buffer, 120, 272, 4);                            // ETA when print will be done
-    }
-    //uint8_t futureSecond = second(futureTime);
-    //uint8_t futureDay = day(futureTime);
-    //uint8_t futureMonth = month(futureTime);
-    //uint16_t futureYear = year(futureTime);
-    //bool futurePM = isPM(futureTime);
-  }
-  //drawGrid();// strictly for helping with line positions on the TFT
-}
-//this checks to see if the seconds needs a poll trigger
-void handlePolling(int8_t theSeconds) {
-  if (theSeconds % thePollTime) {
-    //enablePoll = false;;
-  } else {
-    enablePoll = true;  // yep, it's time!
-  }
-}
-//
-void handleGaugeHeadings() {
-  tft.drawString("Nozzle", 40, headingY, 2);     // labels
-  tft.drawString("Progress", 120, headingY, 2);  // labels
-  tft.drawString("Bed", 200, headingY, 2);       // labels
-}
-//
-void handleGauge(uint8_t whichGauge, int16_t gaugeValue) {
-  float temp;
-  uint16_t theMove;
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  switch (whichGauge) {
-    case nozzleGauge:
-      temp = (float(gaugeValue) / maxNozzleTemp);                                          // what percentage of the nozzle temp are we using?
-      theMove = (temp * 280) + 40;                                                         // get the amount to draw
-      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);      // Nozzle
-      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);  // Active part
-      tft.fillCircle(40, gaugeY, 20, TFT_BLACK);                                           // erase the 250 nozzle
-      if (nozzleTarget != 0) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);  // we are HEATING value in RED
-      }
-      tft.drawString(String(gaugeValue), 40, dataY, 2);  // show the value (not heating)
-      break;
-    case progressGauge:
-      if (printState == "printing") {                                                           // only calculate when printing
-        temp = (float(gaugeValue) / 100);                                                       // progress amount done
-        theMove = (temp * 280) + 40;                                                            // get the amount to draw
-        tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);        // Progress gauge
-        if (theMove > 40) {                                                                     // if we try to draw a zero, it goes around
-          tft.drawSmoothArc(120, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);  // Active part
-        }
-        tft.fillCircle(120, gaugeY, 20, TFT_BLACK);         // percentage done, erase before showing anything new
-        tft.drawString(String(gaugeValue), 120, dataY, 2);  // now show the value we have done
-        showIdle = false;                                   // not showing it now
-      } else {
-        tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);  // turn off the progress
-        tft.drawString("Idle", 120, dataY, 2);                                            // labels
-        if (showIdle == false) {                                                          // if we aqren't showing the idle icon, show it
-          tft.fillRect(0, 206, 239, 64, TFT_BLACK);                                       // get rid of the ETA and end time stuff
-          drawBmp(SD, IDLE_IMAGE, 88, 210);                                               //display idle printer
-          showIdle = true;                                                                // we are showing it
-        }
-      }
-      break;
-    case bedGauge:
-      temp = (float(gaugeValue) / maxBedTemp);                                              // progress amount done
-      theMove = (temp * 280) + 40;                                                          // get the amount to draw
-      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);      // Bed
-      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);  // Active part
-      tft.fillCircle(200, gaugeY, 20, TFT_BLACK);                                           // erase the old  bed number
-      if (bedTarget != 0) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);  // we are HEATING value in RED
-      }
-      tft.drawString(String(gaugeValue), 200, dataY, 2);  // show new bed temp
-      break;
-  }
-}
-void drawGrid() {
-  for (int myY = 0; myY < 320; myY += 16) {
-    tft.drawFastHLine(0, myY, 239, TFT_GREEN);
-  }
-}
-//
-void setRGB(bool redLevel, bool greenLevel, bool blueLevel) {
-  digitalWrite(RED_PIN, !redLevel);
-  digitalWrite(GREEN_PIN, !greenLevel);
-  digitalWrite(BLUE_PIN, !blueLevel);
-}
-//
-void handleHostName() {
-  if (WiFi.status() == WL_CONNECTED) {
-    setRGB(0, greenON, 0);  // see if this does it
-    HTTPClient http;
-    http.setConnectTimeout(100);  // Sets a 1-second connection timeout
-    http.begin(printerURLInfo);   // this gets the host name of the printer
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, payload);
-      if (error) {
-        //drawCenteredText("JSON Error", &FreeMonoBold12pt7b, 0);
-        Serial.println("JSON Error");
-      } else {  // no error process to get the name
-        printerName = doc["result"]["hostname"] | "";
-        Serial.println(printerName);
-      }
-    } else {
-      //Serial.println("No Printer Found");
-    }
-    http.end();
-    setRGB(0, greenOFF, 0);   // turn off the LED
-    if (printerName != "") {  // if we found a printer
-      lastBedTemp = 0;        // zero out all previous settings
-      lastNozzleTemp = 0;     // force an update
-      lastProgress = 0;
-    }
-  }
-}
-// this function includes the heat/levelling/printing/end homing time
-void handleTimeUsed() {
-  char buffer[30];                                  // holds the formated time
-  double elapsed = difftime(printEnd, printStart);  // find the difference
-  tft.fillRect(1, 230, 239, 32, TFT_BLACK);         // remove the END of print time first
-  int32_t totalSeconds = (int)elapsed;
-  int hrs = totalSeconds / 3600;
-  int mins = (totalSeconds % 3600) / 60;
-  // int seconds = totalSeconds % 60;// we don't care about the seconds....
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);           // green to show success
-  if (hrs != 0) {                                   // print took more than 1 hour
-    sprintf(buffer, "Total: %1u:%02u", hrs, mins);  // kill the leading 0 on the hours
-  } else {
-    sprintf(buffer, "Total: %1umins", mins);  // kill the leading 0 on the minutes
-  }
-  drawBmp(SD, IDLE_IMAGE, 88, 210);     //display idle printer
-  showIdle = true;                      // we are showing it
-  tft.drawString(buffer, 120, 304, 4);  // and draw the time the print actually took
-}
-//
-void handleETA() {
-  char timeLeft[24];                        // buffer to use
-  if (printState == "printing") {           // if we are printing something, give me a time
-    if ((progress * 100) > lastProgress) {  // the percentage done has increased
-      lastProgress = progress * 100;        // save it for next time
-      estimateTimeRemaining(printDuration, progress * 100, timeLeft);
-      if (showHeat) {                              // showing the heat icon?
-        tft.fillRect(1, 210, 239, 64, TFT_BLACK);  // erase the icon
-        showHeat = false;                          // we only do it once
-      }
-      if (inPrepMode == false) {                                  // now update the time left
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);                   // white text
-        tft.fillRect(1, 214, 239, 26, TFT_BLACK);                 // remove the old ETA first
-        tft.drawString("ETA: " + String(timeLeft), 120, 240, 4);  // ETA when print will be done
-      }
-      //Serial.print("Remaining time to print: ");
-      //Serial.println(timeLeft);  // in HH:MM
-      activeETA = true;
-    }
-  } else {
-    activeETA = false;
-  }
-}
-//
-void estimateTimeRemaining(float elapsedSeconds, float percentComplete, char *result) {
-  if (percentComplete <= 0.0f || percentComplete > 100.0f) {
-    //snprintf(result, 16, "--:--");
-    snprintf(result, 16, "--:--");
-
-    return;
-  }
-  float totalEstimated = elapsedSeconds / (percentComplete / 100.0f);
-  float remainingSeconds = totalEstimated - elapsedSeconds;
-
-  if (remainingSeconds < 0) remainingSeconds = 0;
-
-  unsigned long remaining = (unsigned long)remainingSeconds;
-  etaHH = remaining / 3600;
-  etaMM = (remaining % 3600) / 60;
-  //unsigned int ss = remaining % 60;
-
-  snprintf(result, 16, "%02u:%02u", etaHH, etaMM);
-}
-//
-void handlePrinterStatus() {
-  if (WiFi.status() == WL_CONNECTED) {                             // are we connected to WIFI?
-    setRGB(0, greenON, 0);                                         // see if this does it
-    HTTPClient http;                                               // setup the http client
-    http.setConnectTimeout(100);                                   // Sets a 1-second connection timeout
-    http.begin(printerURLQ);                                       // string to ask for the printer data
-    int httpCode = http.GET();                                     // and ask for it
-    if (httpCode == 200) {                                         // 200 means the printer replied to us
-      String payload = http.getString();                           // get the stuff it sent into a string
-      JsonDocument doc;                                            // now shove it into a JSON doc
-      DeserializationError error = deserializeJson(doc, payload);  // and setup the data for reading
-      if (error) {                                                 // if there was a data error, well, JSON error!
-        //drawCenteredText("JSON Error", &FreeMonoBold12pt7b, 0);
-        Serial.println("JSON Error");
-      } else {                                                                     // we got good data, JSON is happy, parse it
-        printState = doc["result"]["status"]["print_stats"]["state"] | "unknown";  // either printing or standby
-
-        // Temperatures we always get even when idle
-        nozzleTemp = doc["result"]["status"]["extruder"]["temperature"] | 0.0;  // nozzle current temp
-        if (round(nozzleTemp) != lastNozzleTemp) {                              // we need a change or skip it
-          lastNozzleTemp = round(nozzleTemp);                                   // save the value for next pass
-          handleGauge(nozzleGauge, lastNozzleTemp);                             // and update the gauge
-        }
-        bedTemp = doc["result"]["status"]["heater_bed"]["temperature"] | 0.0;  // current bed temp
-        if (round(bedTemp) != lastBedTemp) {                                   // only update on a change
-          lastBedTemp = round(bedTemp);                                        // save it for next time
-          handleGauge(bedGauge, lastBedTemp);                                  // and update the gauge
-        }
-        printDuration = doc["result"]["status"]["print_stats"]["print_duration"] | 0.0;  // this is 0.00 until bed is hot, levelled and nozzle up to temp
-        progress = doc["result"]["status"]["display_status"]["progress"] | 0.0;          // get the progress....0 to 10.00
-        nozzleTarget = doc["result"]["status"]["extruder"]["target"] | 0.0;              // nozzle target temp
-        bedTarget = doc["result"]["status"]["heater_bed"]["target"] | 0.0;               // target bed temp
-        //
-        if (printState == "standby") {               // if the printer is in standy, it's powered up but idle, not printing
-          lastProgress = 0;                          // reset this for me when idle, used to check progress
-          handleGauge(progressGauge, lastProgress);  // and update the gauge
-          if (gotStartTime == true) {                // we just finished a print job
-            printEnd = time(nullptr);                // grab the ending of the print job
-            gotStartTime = false;                    // reset the flag now
-            if (thePrintFile != "") {
-              tft.fillRect(1, 208, 239, 92, TFT_BLACK);  // get rid of the filename we just printed
-              handleTimeUsed();                          // go show the total time to took for the print job
-            }
-            thePrintFile = "";  // and we aren't printing anything
-            inPrepMode = false;
-          }
-        } else {                                                                           // else we are actually heating/levelling/printing something
-          if (thePrintFile == "") {                                                        // if the name is blank, go get it. once.
-            String temp = doc["result"]["status"]["print_stats"]["filename"] | "Unknown";  // get the filepath
-            thePrintFile = extractFileName(temp, false);                                   // go get the filename without extension
-            tft.loadFont("NotoSansBold15");                                                // Load font
-            tft.setTextColor(TFT_GREEN, TFT_BLACK);                                        // white text
-            tft.setTextDatum(BC_DATUM);
-            tft.fillRect(0, 272, 239, 31, TFT_BLACK);   // get rid of last total print time first
-            tft.drawString(thePrintFile, 120, 296, 2);  // show the name of the file printing
-            //Serial.println(thePrintFile);               //
-            tft.unloadFont();  // Remove font to recover memory
-          }
-          if (gotStartTime == false) {                 // grab the start time
-            gotStartTime = true;                       // set a flag so we only grab it once
-            printStart = time(nullptr);                // or: time(NULL)
-            tft.fillRect(1, 210, 239, 64, TFT_BLACK);  // remove the old total (actual print time and icon) of print time first
-          }
-          // progress 0.00 means we are heating up the bed
-          tft.setTextColor(TFT_WHITE, TFT_BLACK);                                             // set the font colour for me
-          if (printDuration == 0.00) {                                                        // we are heating or levelling
-            tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);  // erase the idle label
-            tft.drawString("PREP", 120, dataY, 2);                                            // show we are in bed heat/level/nozzle heat mode
-            inPrepMode = true;                                                                // working on heating and levelling
-            if (nozzleTarget != 0 || bedTarget != 0) {
-              showHeat = true;                      // flag so we know the icon is visible
-              drawBmp(SD, HEATING_IMAGE, 88, 210);  //display that we're heating up the printer
-            }
-          } else {  // at this point, we are printing
-            inPrepMode = false;
-            progressPercent = int(progress * 100.0);     // make it a number from 0 to 100 (no decimals)
-            if (lastProgress != progressPercent) {       // did the progress change
-              lastProgress = progressPercent;            // save it for next time
-              handleGauge(progressGauge, lastProgress);  // and update the gauge
-            }
-          }
-        }
-      }
-    } else {
-      //Serial.println("Printer Offine");          // the printer just went offline
-      printerName = "";                          // reset the name til we power it back on
-      tft.fillRect(0, 76, 239, 220, TFT_BLACK);  // get rid of anything there it won't be back here.
-      showSleep = false;                         // back to waiting on the printer
-    }
-    http.end();              // close off the http request
-    setRGB(0, greenOFF, 0);  // see if this does it
-  } else {
-    Serial.println("WiFi is lost");  // for whatever reason,we lost wifi
-  }
-}
-//
-//To Display <Setup> if not connected to AP
-void configModeCallback(WiFiManager *myWiFiManager) {
-  //Serial.println("Setup");
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(String(hostNameCYD), SCREEN_W / 2, SCREEN_H / 2, 4);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.loadFont("NotoSansBold15");  // Load font
-  tft.drawString("Access Point Active", SCREEN_W / 2, (SCREEN_H / 2) + 36, 2);
-  tft.unloadFont();  // Remove font to recover memory
-  delay(2000);
-}
-//
-/*-------- NTP code ----------*/
-
-const int NTP_PACKET_SIZE = 48;      // NTP time is in the first 48 bytes of message
-byte packetBuffer[NTP_PACKET_SIZE];  //buffer to hold incoming & outgoing packets
-
-time_t getNtpTime() {
-  IPAddress timeServerIP;  // time.nist.gov NTP server address
-
-  while (Udp.parsePacket() > 0)
-    ;  // discard any previously received packets
-  //  Serial.print(F("Transmit NTP Request "));
-  //get a random server from the pool
-  WiFi.hostByName(ntpServerName, timeServerIP);
-  //  Serial.println(timeServerIP);
-
-  sendNTPpacket(timeServerIP);
-  uint32_t beginWait = millis();
-  while ((millis() - beginWait) < 1500) {
-    int size = Udp.parsePacket();
-    if (size >= NTP_PACKET_SIZE) {
-      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
-      unsigned long secsSince1900;
-      // convert four bytes starting at location 40 to a long integer
-      secsSince1900 = (unsigned long)packetBuffer[40] << 24;
-      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-      secsSince1900 |= (unsigned long)packetBuffer[43];
-      return secsSince1900 - 2208988800UL;
-    }
-  }
-  return 0;  // return 0 if unable to get the time
-}
-//
-// send an NTP request to the time server at the given address
-void sendNTPpacket(IPAddress &address) {
-
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  packetBuffer[0] = 0b11100011;  // LI, Version, Mode
-  packetBuffer[1] = 0;           // Stratum, or type of clock
-  packetBuffer[2] = 6;           // Polling Interval
-  packetBuffer[3] = 0xEC;        // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12] = 49;
-  packetBuffer[13] = 0x4E;
-  packetBuffer[14] = 49;
-  packetBuffer[15] = 52;
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  Udp.beginPacket(address, 123);  //NTP requests are to port 123
-  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-  Udp.endPacket();
-}
-//
-String SendHTML() {
-  String ptr = "<!DOCTYPE html> <html>\n";
-  ptr += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">\n";
-  ptr += "<title>KlippyMon</title>\n";
-  ptr += "<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}\n";
-  ptr += "body{margin-top: 50px;} h1 {color: #444444;} h3 {color: #444444;} h4 {color: #444444;}\n";
-  ptr += ".button {display: block;width: 80px;background-color: #1abc9c;border: none;color: white;padding: 13px 30px;text-decoration: none;font-size: 25px;margin: 0px auto 35px;cursor: pointer;border-radius: 4px;}\n";
-  ptr += ".button-on {background-color: #1abc9c;}\n";
-  ptr += ".button_on {background-color: #1abc9c;}\n";
-  ptr += ".button-off {background-color: #FF2D00;}\n";
-  ptr += ".button_off {background-color: #FF2D00;}\n";
-  ptr += ".infoButton {background-color: #e7e7e7; color: black;}\n";
-  ptr += ".resetBTN {background-color: #f44336;}\n"; /* RED */
-  ptr += "p {font-size: 14px;color: #888;margin-bottom: 10px;}\n";
-  ptr += "</style>\n";
-  ptr += "</head>\n";
-  ptr += "<body>\n";
-  ptr += "<h1>Printer Configuration</h1>";
-  ptr += "<h3>WabbitWanch Design</h3>";
-  ptr += "<h4>Version: " + String(VERSION) + " - WiFi: " + String(getWifiQuality()) + "</h4>\n";
-  //
-  ptr += getPrinterSetup();  // add in all the printer settings
-  //
-  ptr += "<br><hr style=\"width:20%\">";
-  ptr += "Wifi Control";
-  ptr += "<a class=\"button resetBTN\" href=\"/wifiReset\">RESET</a>\n";
-  //   ptr += "<br><br>" + DEBUG;
-  ptr += "</body>\n";
-  ptr += "</html>\n";
-  return ptr;
-}
-//
-void handlePrinterUpdate() {
-  String temp;
-  if (server.hasArg("printerIP")) {  // update the new IP number
-    printerIP = server.arg("printerIP");
-  }
-  if (server.hasArg("maxBedTemp")) {
-    temp = server.arg("maxBedTemp");
-  }
-  maxBedTemp = temp.toInt();
-
-  if (server.hasArg("maxNozzleTemp")) {
-    temp = server.arg("maxNozzleTemp");
-  }
-  maxNozzleTemp = temp.toInt();
-
-  if (server.hasArg("show24HR")) {  // this only shows if the box was checked
-    show24HR = true;
-    //}
-  } else {  // checkbox is off
-    show24HR = false;
-  }
-  writeSettings();                            // go update the settings
-  buildPrinterURLs();                         // update the printer URLS for me now
-  server.send(200, "text/html", SendHTML());  // and update the web display
-}
-//
-String getPrinterSetup() {
-  String printerForm = String(printer_Info);            //get the printer info first
-  printerForm.replace("%IP%", printerIP);               // replace the IP
-  printerForm.replace("%MBT%", String(maxBedTemp));     // maximum bed temp
-  printerForm.replace("%MNT%", String(maxNozzleTemp));  // maximum nozzle temperature
-  if (show24HR == true) {                               // if this on, we want to show checkbox is on
-    printerForm.replace("%boxState%", "checked");       // want 24hr time?
-  } else {                                              // else it's off so leave it
-    printerForm.replace("%boxState%", "unchecked");     // want 24hr time?
-  }
-  return printerForm;  // and go back with the values
-}
-//
-void writeSettings() {
-  // Save decoded message to SPIFFS file for playback on power up.
-  File f = LittleFS.open(CONFIG, "w");
-  if (!f) {
-    Serial.println("File open failed!");
-  } else {
-    Serial.println("Saving settings now...");
-    f.println("printerIP=" + printerIP);
-    f.println("maxBedTemp=" + String(maxBedTemp));
-    f.println("maxNozzleTemp=" + String(maxNozzleTemp));
-    f.println("show24HR=" + String(show24HR));
-    f.close();
-  }
-  //readSettings();
-}
-//
-void readSettings() {
-  if (LittleFS.exists(CONFIG) == false) {
-    Serial.println("Settings File does not yet exist");
-    writeSettings();
-    return;
-  }
-  File fr = LittleFS.open(CONFIG, "r");
-  String line;
-  while (fr.available()) {
-    line = fr.readStringUntil('\n');
-
-    if (line.indexOf("printerIP=") >= 0) {
-      printerIP = line.substring(line.lastIndexOf("printerIP=") + 10);
-      printerIP.trim();
-      Serial.println("printerIP: " + printerIP);
-    }
-    if (line.indexOf("maxBedTemp=") >= 0) {
-      maxBedTemp = line.substring(line.lastIndexOf("maxBedTemp=") + 11).toInt();
-      Serial.println("maxBedTemp: " + String(maxBedTemp));
-    }
-    if (line.indexOf("maxNozzleTemp=") >= 0) {
-      maxNozzleTemp = line.substring(line.lastIndexOf("maxNozzleTemp=") + 14).toInt();
-      Serial.println("maxNozzleTemp: " + String(maxNozzleTemp));
-    }
-    if (line.indexOf("show24HR=") >= 0) {
-      show24HR = line.substring(line.lastIndexOf("show24HR=") + 9).toInt();
-      Serial.println("show24HR: " + String(show24HR));
-    }
-  }
-  fr.close();
-  // now we need to update our settings for the URL
-  //printerClient.updatePrintClient(PrinterApiKey, PrinterServer, PrinterPort, PrinterAuthUser, PrinterAuthPass, HAS_PSU);
-}
-void buildPrinterURLs() {
-  printerURLInfo = "http://" + printerIP + printerINFO;  // looks for the printer at the IP address given
-  //Serial.println(printerURLInfo);
-  printerURLQ = "http://" + printerIP + printQuery;  // and this is all the data when the printer is active
-  //Serial.println(printerURLQ);
-}
-
-// Extract filename WITH or WITHOUT extension (ie "TOP_PLA" or "TOP_PLA.gcode")
+// ============================================================
+//  FILENAME HELPER
+// ============================================================
 String extractFileName(const String &path, bool withExt) {
-  if (withExt == false) {                                 // just return the name without the extension (.gcode)
-    int slashIdx = path.lastIndexOf('/');                 // find the last /
-    int dotIdx = path.lastIndexOf('.');                   // and where the last . starts
-    int start = (slashIdx >= 0) ? slashIdx + 1 : 0;       // and then the start of the name
-    int end = (dotIdx > start) ? dotIdx : path.length();  // and the end position
-    return path.substring(start, end);                    // now extract the name from that
+  int slashIdx = path.lastIndexOf('/');
+  int start = (slashIdx >= 0) ? slashIdx + 1 : 0;
+
+  String result;
+  if (!withExt) {
+    int dotIdx = path.lastIndexOf('.');
+    int end = (dotIdx > start) ? dotIdx : path.length();
+    result = path.substring(start, end);
   } else {
-    int slashIdx = path.lastIndexOf('/');  // find the last / before the filename
-    return path.substring(slashIdx + 1);   // grab the whole name with extension
+    result = path.substring(start);
   }
+
+  if (result.length() > 28) result = result.substring(0, 28) + "~";
+  return result;
 }
 
-void handleWifiReset() {  // this will wipe the WIFI settings
+// ============================================================
+//  WIFI RESET
+// ============================================================
+void handleWifiReset() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Wifi reset in 5 seconds", SCREEN_W / 2, SCREEN_H / 2, 2);
+  tft.drawString("WiFi reset in 5 seconds", SCREEN_W / 2, SCREEN_H / 2, 2);
   delay(5000);
   redirectHome();
   delay(1000);
   WiFiManager wifiManager;
-  wifiManager.resetSettings();  // kill the config for the WIFI
-  ESP.restart();                // then kick back into the portal mode
+  wifiManager.resetSettings();
+  ESP.restart();
 }
 
 void redirectHome() {
-  // Send them back to the Root Directory
   server.sendHeader("Location", String("/"), true);
   server.sendHeader("Cache-Control", "no-cache, no-store");
   server.sendHeader("Pragma", "no-cache");
@@ -998,4 +1227,82 @@ void redirectHome() {
   server.send(302, "text/plain", "");
   server.client().stop();
 }
-//
+
+// Called by PNGdec for each decoded row
+int pngDraw(PNGDRAW *pDraw) {
+  uint16_t lineBuffer[110];
+  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  tft.pushImage(graphicX, graphicY + pDraw->y, pDraw->iWidth, 1, lineBuffer);
+  return 1;  // return 1 to continue decoding
+}
+
+bool fetchAndDrawThumbnail() {
+
+  // Strip extension for thumbnail lookup
+  String thumbFile = thePrintFileRaw;
+  int slashIdx = thumbFile.lastIndexOf('/');
+  if (slashIdx >= 0) thumbFile = thumbFile.substring(slashIdx + 1);
+  int dotIdx = thumbFile.lastIndexOf('.');
+  if (dotIdx > 0) thumbFile = thumbFile.substring(0, dotIdx);
+
+  String encodedFile = thumbFile;
+  encodedFile.replace(" ", "%20");
+  encodedFile.replace("(", "%28");
+  encodedFile.replace(")", "%29");
+  encodedFile.replace("[", "%5B");
+  encodedFile.replace("]", "%5D");
+  encodedFile.replace("&", "%26");
+  encodedFile.replace("+", "%2B");
+
+  String thumbURL = "http://" + printerIP + ":" + printerPort + "/server/files/gcodes/.thumbs/" + encodedFile + "-110x110.png";
+  // Serial.println("Raw: " + thePrintFileRaw);
+  // Serial.println("Thumb file: " + thumbFile);
+  // Serial.println("Full URL: " + thumbURL);
+
+  httpThumb.begin(thumbURL);
+  int httpCode = httpThumb.GET();
+
+  if (httpCode != 200) {
+    Serial.println("Thumb fetch failed: " + String(httpCode));
+    httpThumb.end();
+    return false;
+  }
+
+  thumbBufferSize = httpThumb.getSize();
+  //Serial.println("Thumb size: " + String(thumbBufferSize) + " bytes");
+
+  thumbBuffer = (uint8_t *)malloc(thumbBufferSize);
+  if (!thumbBuffer) {
+    Serial.println("malloc failed!");
+    httpThumb.end();
+    return false;
+  }
+
+  // Read the PNG data into the buffer
+  WiFiClient *stream = httpThumb.getStreamPtr();
+  int bytesRead = 0;
+  while (httpThumb.connected() && bytesRead < thumbBufferSize) {
+    if (stream->available()) {
+      thumbBuffer[bytesRead++] = stream->read();
+    }
+  }
+  httpThumb.end();
+
+  Serial.println("Bytes read: " + String(bytesRead));
+
+  // Decode and draw
+  int rc = png.openRAM(thumbBuffer, bytesRead, pngDraw);
+  if (rc == PNG_SUCCESS) {
+    tft.startWrite();
+    rc = png.decode(NULL, 0);
+    tft.endWrite();
+    png.close();
+  } else {
+    Serial.println("PNG open failed: " + String(rc));
+  }
+
+  free(thumbBuffer);
+  thumbBuffer = nullptr;
+
+  return (rc == PNG_SUCCESS);
+}

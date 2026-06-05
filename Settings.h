@@ -1,86 +1,40 @@
-/** The MIT License (MIT)
-
-Copyright (c) 2026 Mel Patrick
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
-
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <DNSServer.h>  //https://github.com/esp8266/Arduino/tree/master/libraries/DNSServer
+#include <DNSServer.h>
 #include <ESPmDNS.h>
-#include <ArduinoOTA.h>
-#include <WiFiManager.h>  //https://github.com/tzapu/WiFiManager
+#include <WiFiManager.h>
 #include <time.h>
 #include <SPI.h>
-#include <SD.h>
 #include <Timezone.h>
 #include <TFT_eSPI.h>
 #include <FS.h>
 #include "LittleFS.h"
 #include <WebServer.h>
+#include <PNGdec.h>
 
-//  http://192.168.1.115:7125/printer/objects/query?print_stats&server&virtual_sdcard&toolhead&display_status&heater_bed
-//these are the settings for your printer
-// maximums for bed temp and nozzle temp
-uint8_t maxBedTemp = 120;
-uint16_t maxNozzleTemp = 350;
-
-//this the IP information of your printer on the LAN
-String printerIP = "192.168.1.6";  // just a default IP address, put yours in if you know it
-
-String printQuery = ":7125/printer/objects/query?print_stats&display_status&extruder&heater_bed";
-String printerINFO = ":7125/printer/info";
-String printerURLQ = "";
-String printerURLInfo = "";
-String thePrintFile = "";  // filename of the currently printing file
-
-// This is the graphic that shows when the printer is powered off
-#define OFFLINE_IMAGE "/Asleep.bmp"   // graphics MUST be in 24bit format 186 x 186 (H x W)
-#define IDLE_IMAGE "/Idle.bmp"        // graphic when active but not printing (64 x 64)
-#define HEATING_IMAGE "/Heating.bmp"  // graphic to indicate heating
-//
-// ---------------- SD Card FILES ----------------
-#define SD_MOSI 23  // pin numbers for the CDY 2.8 7789
-#define SD_MISO 19
-#define SD_SCK 18
-#define SD_CS 5
+// ---------------- TIME ZONES ----------------
+// TimeZone Settings: https://github.com/JChristensen/Timezone
+// Uncomment the one you need, comment out the rest
 
 //Australia Eastern Time Zone (Sydney, Melbourne)
-TimeChangeRule aEDT = { "AEDT", First, Sun, Oct, 2, 660 };  //UTC + 11 hours
-TimeChangeRule aEST = { "AEST", First, Sun, Apr, 3, 600 };  //UTC + 10 hours
+TimeChangeRule aEDT = { "AEDT", First, Sun, Oct, 2, 660 };
+TimeChangeRule aEST = { "AEST", First, Sun, Apr, 3, 600 };
 //Timezone timeZoneRule(aEDT, aEST);
 
 //Central European Time (Frankfurt, Paris)
-TimeChangeRule CEST = { "CEST", Last, Sun, Mar, 2, 120 };  //Central European Summer Time
-TimeChangeRule CET = { "CET ", Last, Sun, Oct, 3, 60 };    //Central European Standard Time
+TimeChangeRule CEST = { "CEST", Last, Sun, Mar, 2, 120 };
+TimeChangeRule CET = { "CET ", Last, Sun, Oct, 3, 60 };
 //Timezone timeZoneRule(CEST, CET);
 
 //United Kingdom (London, Belfast)
-TimeChangeRule BST = { "BST", Last, Sun, Mar, 1, 60 };  //British Summer Time
-TimeChangeRule GMT = { "GMT", Last, Sun, Oct, 2, 0 };   //Standard Time
+TimeChangeRule BST = { "BST", Last, Sun, Mar, 1, 60 };
+TimeChangeRule GMT = { "GMT", Last, Sun, Oct, 2, 0 };
 //Timezone timeZoneRule(BST, GMT);
 
 //US Eastern Time Zone (New York, Detroit)
-TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };  //Eastern Daylight Time = UTC - 4 hours
-TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };   //Eastern Standard Time = UTC - 5 hours
+TimeChangeRule usEDT = { "EDT", Second, Sun, Mar, 2, -240 };
+TimeChangeRule usEST = { "EST", First, Sun, Nov, 2, -300 };
 //Timezone timeZoneRule(usEDT, usEST);
 
 //US Central Time Zone (Chicago, Houston)
@@ -93,27 +47,168 @@ TimeChangeRule usMDT = { "MDT", Second, dowSunday, Mar, 2, -360 };
 TimeChangeRule usMST = { "MST", First, dowSunday, Nov, 2, -420 };
 //Timezone timeZoneRule(usMDT, usMST);
 
-//Arizona is US Mountain Time Zone but does not use DST
+//Arizona - Mountain Time, no DST
 //Timezone timeZoneRule(usMST, usMST);
 
 //US Pacific Time Zone (Las Vegas, Los Angeles)
 TimeChangeRule usPDT = { "PDT", Second, dowSunday, Mar, 2, -420 };
 TimeChangeRule usPST = { "PST", First, dowSunday, Nov, 2, -480 };
 //Timezone timeZoneRule(usPDT, usPST);
-//
-// ---------------- TIME HELPER ----------------
-//TimeZone Settings Details https://github.com/JChristensen/Timezone
-//BC Canada Pacific Standard Time always
-TimeChangeRule bcPDT = { "PDT", Second, dowSunday, Mar, 2, -420 };  // 7 hour offset - BC, Canada
 
-//Edit the info in the (xxx,xxx) according To Your Timezone and Daylight Saving Time
-// for example if in the US pacific northwest you'd use
-// Timezone timeZoneRule(usPDT, usPST);
-// Examples are provided above for various timezone settings
-//
+// BC Canada Pacific Time (ACTIVE)
+TimeChangeRule bcPDT = { "PDT", Second, dowSunday, Mar, 2, -420 };
 Timezone timeZoneRule(bcPDT, bcPDT);
 
-//Pointer To The Time Change Rule, Use to Get The TZ Abbrev
+// Pointer to the time change rule, used to get TZ abbreviation
 TimeChangeRule *tcr;
 time_t utc;
 bool show24HR = false;
+
+// IP information of your printer on the LAN
+String printerIP = "192.168.1.6";  // default IP, set yours via the web page
+String printerPort = "7125";       // Moonraker default. QIDI printers use 10088
+
+// ── ntfy Push Notifications ────────────────────────────────
+bool    ntfyEnabled  = false;
+String  ntfyServer   = "http://192.168.1.82:2586";// local hosted or https://ntfy.sh
+String  ntfyTopic    = "klippymon";
+String  ntfyToken    = "";
+uint8_t ntfyStallMin = 2;
+String  ntfyPort     = "2586";// can be any port you want if local hosting
+
+// -- URL query information from the printer
+String printQuery = "/printer/objects/query?print_stats&display_status&extruder&heater_bed";
+String printerINFO = "/printer/info";
+String printerURLQ = "";
+String printerURLInfo = "";
+String thePrintFile = "";  // filename of the currently printing file
+
+// ---------------- GRAPHICS (in LittleFS /data folder) ----------------
+#define OFFLINE_IMAGE "/Asleep.bmp"     // 24-bit BMP, 186 x 186
+#define IDLE_IMAGE "/Idle.bmp"          // 24-bit BMP, 110 x 110
+#define HEATING_IMAGE "/Heating.bmp"    // 24-bit BMP, 110 x 110
+#define PRINTING_IMAGE "/Printing.bmp"  // 24-bit BMP, 110 x 110
+#define SUCCESS_IMAGE "/Success.bmp"    // 24-bit BMP, 110 x 110
+
+// ---------------- FONTS (in LittleFS /data folder) ----------------
+#define AA_FONT_SMALL "NotoSansBold15"  // 15 point sans serif bold
+#define AA_FONT_LARGE "NotoSansBold36"  // 36 point sans serif bold
+
+// maximums for bed temp and nozzle temp
+uint8_t maxBedTemp = 120;
+uint16_t maxNozzleTemp = 350;
+
+// ---- setup for Klipper printers with heated chambers ----
+bool hasChamber = false;
+float chamberTemp = 0.0;
+float chamberTarget = 0.0;
+String chamberSensorName = "";// depends what the brand calls their chamber
+
+PNG png;
+HTTPClient httpThumb;
+uint8_t *thumbBuffer = nullptr;
+int thumbBufferSize = 0;
+
+// ---------------- WEB PAGE TEMPLATE ----------------
+// Placeholders: %IP%  %PORT%  %MBT%  %MNT%  %boxState%
+const char printer_Info[] PROGMEM = R"rawliteral(
+<form action="/updatePrinterInfo">
+  <div class="field">
+    <label>Printer IP</label>
+    <input type="text" name="printerIP" value="%IP%">
+  </div>
+  <div class="field">
+    <label>Printer Port</label>
+    <input type="text" name="printerPort" value="%PORT%">
+  </div>
+  <div class="field">
+    <label>24 Hour Clock</label>
+    <label class="toggle">
+      <input type="checkbox" name="show24HR" %boxState%>
+      <span class="slider"></span>
+    </label>
+  </div>
+)rawliteral";
+
+// ============================================================
+//  MAIN WEB PAGE TEMPLATE — stored in flash
+// ============================================================
+const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html>
+<head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KlippyMon</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Helvetica, sans-serif; background: #1a1a1a; color: #ccc; }
+.container { max-width: 800px; margin: 0 auto; padding: 20px; }
+header { text-align: center; padding: 30px 0 20px; }
+header h1 { font-size: 2em; color: #00bcd4; margin-bottom: 6px; }
+header h3 { font-size: 1em; color: #666; font-weight: normal; }
+header h4 { font-size: 0.9em; color: #555; font-weight: normal; margin-top: 4px; }
+.card { background: #252525; border-radius: 12px; padding: 24px; margin-bottom: 20px; border: 1px solid #333; }
+.card h2 { font-size: 0.8em; color: #00bcd4; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 16px; }
+.field { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #333; }
+.field:last-of-type { border-bottom: none; }
+.field label { font-size: 0.95em; color: #ccc; }
+.field input[type=text] { width: 180px; padding: 8px 12px; background: #333; border: 1px solid #444; border-radius: 6px; font-size: 0.95em; color: #fff; }
+.field input[type=text]:focus { outline: none; border-color: #00bcd4; }
+.toggle { position: relative; width: 46px; height: 26px; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #444; border-radius: 26px; transition: 0.3s; }
+.slider:before { position: absolute; content: ''; height: 20px; width: 20px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }
+input:checked + .slider { background: #00bcd4; }
+input:checked + .slider:before { transform: translateX(20px); }
+.btn { display: block; width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1em; font-weight: bold; cursor: pointer; margin-top: 16px; letter-spacing: 1px; }
+.btn-update { background: #00bcd4; color: #111; }
+.btn-update:hover { background: #00acc1; }
+.btn-reset { background: #c0392b; color: white; }
+.btn-reset:hover { background: #a93226; }
+.mbg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;align-items:center;justify-content:center}
+.mbg.open{display:flex}
+.modal{background:#252525;border:1px solid #c0392b;border-radius:12px;padding:28px 24px;max-width:340px;width:90%;text-align:center}
+.modal h3{color:#c0392b;margin-bottom:12px;font-size:17px}
+.modal p{color:#888;font-size:14px;margin-bottom:20px;line-height:1.5}
+.mbtns{display:flex;gap:10px;justify-content:center}
+.mok{background:#c0392b;border:none;color:#fff;padding:9px 22px;border-radius:7px;font-size:14px;font-weight:600;cursor:pointer}
+.mno{background:transparent;border:1px solid #888;color:#888;padding:9px 22px;border-radius:7px;font-size:14px;cursor:pointer}
+</style></head>
+<body><div class="container">
+<div class='mbg' id='wm'><div class='modal'>
+<h3>%WIFI_RESET_TITLE%</h3>
+<p>%WIFI_RESET_BODY%</p>
+<div class='mbtns'>
+<button class='mok' onclick='window.location="/wifiReset"'>%WIFI_RESET_YES%</button>
+<button class='mno' onclick='document.getElementById("wm").classList.remove("open")'>%WIFI_RESET_CANCEL%</button>
+</div></div></div>
+<header>
+<h1>KlippyMon</h1>
+<h3>WabbitWanch Design</h3>
+<h4>Version %VERSION% &nbsp;&bull;&nbsp; WiFi %WIFI_QUALITY%%</h4>
+</header>
+<div class="card">
+<h2>%SEC_PRINTER%</h2>
+%PRINTER_SETUP%
+</div>
+<div class="card">
+<h2>%SEC_NTFY%</h2>
+<div class="field"><label>%NTFY_ENABLED%</label>
+<label class="toggle"><input type="checkbox" name="ntfyEnabled"%NTFY_ENABLED_CHECKED%><span class="slider"></span></label></div>
+<div class="field"><label>%NTFY_SERVER%</label>
+<input type="text" name="ntfyServer" value="%NTFY_SERVER_VAL%"></div>
+<div class="field"><label>%NTFY_PORT%</label>
+<input type="text" name="ntfyPort" value="%NTFY_PORT_VAL%"></div>
+<div class="field"><label>%NTFY_TOPIC%</label>
+<input type="text" name="ntfyTopic" value="%NTFY_TOPIC_VAL%"></div>
+<div class="field"><label>%NTFY_TOKEN%</label>
+<input type="text" name="ntfyToken" value="%NTFY_TOKEN_VAL%"></div>
+<div class="field"><label>%NTFY_STALL_MIN%</label>
+<input type="text" name="ntfyStallMin" value="%NTFY_STALL_MIN_VAL%"></div>
+</div>
+<button class="btn btn-update" type="submit">%SAVE_BTN%</button>
+</form>
+<div class="card">
+<h2>%SEC_WIFI%</h2>
+<button class="btn btn-reset" onclick="document.getElementById('wm').classList.add('open')">%WIFI_RESET_BTN%</button>
+</div>
+</div></body></html>
+)rawliteral";
