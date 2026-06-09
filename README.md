@@ -1,3 +1,5 @@
+Most of the info here is all teh same except the code is for a 3.5" CYD and has exta nozzles and hard code chamber temp for Snapmaker U1
+
 # KlippyMon v3.4
 ### A Klipper 3D Printer Monitor for the ESP32 CYD (Cheap Yellow Display)
 
