@@ -84,7 +84,7 @@ String printerName = "";
 String printState;
 float progress, nozzleTemp, nozzleTarget, bedTemp, bedTarget, printDuration, totalDuration;
 uint16_t progressPercent;
-uint16_t lastNozzleTemp, lastBedTemp, lastProgress;
+uint16_t lastBedTemp, lastProgress;
 
 bool greenON = true;
 bool greenOFF = false;
@@ -942,9 +942,10 @@ void updatePrinterDisplay(PrinterState state) {
     case STATE_PRINTING:
       showIdle = false;
       justFinished = false;
-      invalidateAllGauges();
+
       // Runs once when an edge trigger signals a brand new print initialization frame
       if (thePrintFile != "" && (lastState != STATE_PRINTING || forcePoll)) {
+        invalidateAllGauges();
         ntfyResetForNewPrint();
         // Force ALL gauges to redraw on first PRINTING frame
         lastProgress = 999;
@@ -962,8 +963,6 @@ void updatePrinterDisplay(PrinterState state) {
           drawBmp(LittleFS, PRINTING_IMAGE, graphicX + 7, graphicY + 7);
         }
 
-        // Force an immediate layout calculation pass
-        handleGauge(progressGauge, 0);
         lastProgress = 0;
       }
 
@@ -978,7 +977,6 @@ void updatePrinterDisplay(PrinterState state) {
         } else if (thumbBuffer != NULL) {
           fetchAndDrawThumbnail();
         }
-        invalidateAllGauges();
         // This executes your newly aligned text and centers everything dynamically
         handleETA();
       }
