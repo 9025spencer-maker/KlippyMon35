@@ -6,7 +6,7 @@
 
 //#define FORMAT_LittleFS  // Wipe LittleFS and all files! Disable after use.
 
-#define VERSION "v3.4"
+#define VERSION "v3.5"  //refactored for 3248S035C 3.5" display and added 4 tool heads for the Snapmaker U1 - Dave Williams
 #define hostNameCYD "KlippyMon"
 #define CONFIG "/config.txt"
 
@@ -14,32 +14,66 @@
 #define nozzleGauge 1
 #define progressGauge 2
 #define bedGauge 3
+#define nozzle2Gauge 4
+#define nozzle3Gauge 5
+#define nozzle4Gauge 6
 
-// ---------------- LAYOUT Y POSITIONS ----------------
+// Extruder State Arrays (0 = Extruder/Nozzle 1, 1 = Extruder1/Nozzle 2, etc.)
+float nozzleTemps[4] = { 0.0, 0.0, 0.0, 0.0 };
+float nozzleTargets[4] = { 0.0, 0.0, 0.0, 0.0 };
+int maxNozzleTemps[4] = { 350, 350, 350, 350 };  // Default limit placeholders
+uint16_t lastNozzleTemps[4] = { 0, 0, 0, 0 };
 
-#define clockBottomY 44  // tighten clock up
-#define printerNameY 60  // tighter below clock
-#define headingY 77      // gauge headings
-#define gaugeY 112       // arc centres (moved up 16px)
-#define dataY 110        // gauge values
-#define statusZoneY 146  // status zone starts earlier
-#define graphicX 65      // re-centre: (240-110)/2
-#define graphicY 147     // graphic starts here, ends at 257
-#define endTimeY 284     // ETA/End line (257 + 4 + ~11px font)
-#define filenameY 300    // filename
-#define versionY 308     // version string
-#define statusZoneH (versionY - 16 - statusZoneY)
-#define belowClockY 44  // start of area below clock, used for fillRect clears
-#define chamberX 32     // for display a chamber temp if you have one
-#define chamberY 195    // ditto
+#define gaugeY 112    // arc centres (moved up 16px)
+#define dataY 110     // gauge values
+#define chamberX 32   // for display a chamber temp if you have one
+#define chamberY 195  // ditto
+
+
+// ---------------- DISPLAY ----------------
+#define SCREEN_W 320
+#define SCREEN_H 480
+
+// ---------------- ALIGNED HEADER GRID METRICS (CLOCK & VERSION SHIFTED UP 20) ----------------
+#define clockBottomY 35  // Shifted UP by 20 (from 65 to 45)
+#define printerNameY 52
+
+// X-Axis Grid Positions (Remains Left Column vs Cross-Page Rows)
+#define LEFT_COL_X 53  // Vertical stack line for T0, T1, T2, T3
+#define PROG_X 53      // Center left row for Progress
+#define BED_X 160      // Center right row for Bed
+#define CHMBR_X 267    // Top Row: Right Column Center
+#define TOP_ROW_Y 125  // Height for Progress, Bed, and Chamber
+#define PROG_Y 125
+#define BED_Y 125
+
+// Nozzles 1-4 mapped horizontally below Progress & Bed
+#define N1_X 40
+#define N2_X 120
+#define N3_X 200
+#define N4_X 280
+#define NOZ_ROW_Y 205
+
+// Y-Axis Heights for Toolheads Stack (Left Column)
+#define T0_Y 125  // Locked to row line 125
+#define T1_Y 205
+#define T2_Y 285
+#define T3_Y 365
+
+// Lower Dashboard & Thumbnail Zone
+#define statusZoneY 250
+#define graphicX 105
+#define graphicY 255
+#define endTimeY 415
+#define filenameY 435
+#define versionY 462  // Shifted UP by 20 (from 482 to 462)
+#define statusZoneH (versionY - 5 - statusZoneY)
+#define belowClockY 65
+
 // ---------------- RGB LED ----------------
 #define RED_PIN 22
 #define GREEN_PIN 16
 #define BLUE_PIN 17
-
-// ---------------- DISPLAY ----------------
-#define SCREEN_W 240
-#define SCREEN_H 320
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -61,6 +95,8 @@ uint8_t thePollTime = 10;
 bool forcePoll = true;  // true at boot, true after settings update
 
 float savedTotalDuration = 0.0;  // save the total duration so it doesn't get nop'd out
+
+unsigned long completionTimestamp = 0;  // Tracks success screen duration before idle reversion
 
 // ---------------- PRINTER STATE MACHINE ----------------
 typedef enum {
@@ -114,7 +150,6 @@ void setRGB(bool redLevel, bool greenLevel, bool blueLevel);
 void handleHostName();
 void handleTimeUsed();
 void handleETA();
-void estimateTimeRemaining(float elapsedSeconds, float percentComplete, char *result);
 bool fetchPrinterData();
 PrinterState determinePrinterState();
 void updatePrinterDisplay(PrinterState state);
@@ -147,7 +182,8 @@ void beginHTTP(HTTPClient &http, const String &url);  // timeouts for http
 void drawVersionString() {
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(String(VERSION) + " @2026 - Wabbit Wanch Design", 120, versionY, 2);
+  // Centered at 160 (320 / 2)
+  tft.drawString(String(VERSION) + " @2026 - Wabbit Wanch Design", 160, versionY, 2);
 }
 
 // ============================================================
@@ -257,11 +293,11 @@ void loop() {
 // ============================================================
 void drawWiFiQuality() {
   const byte numBars = 5;
-  const byte barWidth = 3;
-  const byte barHeight = 20;
+  const byte barWidth = 4;  // Made bars slightly wider for visibility on larger glass
+  const byte barHeight = 22;
   const byte barSpace = 1;
-  const uint16_t barXPosBase = SCREEN_W - 25;
-  const byte barYPosBase = 20;
+  const uint16_t barXPosBase = SCREEN_W - 30;  // Positioned relative to 320 width
+  const byte barYPosBase = 25;
   const uint16_t barColor = TFT_YELLOW;
   const uint16_t barBackColor = TFT_DARKGREY;
 
@@ -307,7 +343,6 @@ int8_t getWifiQuality() {
 void handle_ClockDisplay() {
   char buffer[24];
   uint8_t theHour;
-
   time_t utc = now();
   time_t localTime = timeZoneRule.toLocal(utc, &tcr);
 
@@ -319,27 +354,24 @@ void handle_ClockDisplay() {
   myMonth = month(localTime);
   myYear = year(localTime);
 
-  uint8_t xpos = (SCREEN_W / 2) - 1;
-
+  // Center horizontally on a 320px width screen
+  uint16_t xpos = (SCREEN_W / 2);
   tft.loadFont(AA_FONT_LARGE, LittleFS);
   tft.setTextDatum(BC_DATUM);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
   theHour = (show24HR) ? my24Hour : myHour;
-
   if (colonBlink == false) {
     sprintf(buffer, " %2u:%02u ", theHour, myMinute);
   } else {
     sprintf(buffer, " %2u %02u ", theHour, myMinute);
   }
   colonBlink = !colonBlink;
-
   tft.setTextPadding(tft.textWidth(" 44:44 "));
   tft.drawString(buffer, xpos, clockBottomY);
   tft.setTextPadding(0);
   tft.unloadFont();
 
-  // Save for next pass
   lastSecond = mySecond;
   lastMinute = myMinute;
   lastHour = my24Hour;
@@ -348,7 +380,6 @@ void handle_ClockDisplay() {
   lastMonth = myMonth;
 
   handlePolling(mySecond);
-
   if (mySecond == (thePollTime + 5)) {
     drawWiFiQuality();
   }
@@ -369,63 +400,128 @@ void handlePolling(int8_t theSeconds) {
 }
 
 // ============================================================
-//  GAUGE HEADINGS
+//  GAUGE HEADINGS (3 OVER 4 CENTERED LAYOUT)
 // ============================================================
 void handleGaugeHeadings() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(BC_DATUM);
-  tft.drawString(strNozzle, 40, headingY, 2);
-  tft.drawString(strProgress, 120, headingY, 2);
-  tft.drawString(strBed, 200, headingY, 2);
+  tft.setTextPadding(0);
+  tft.setTextDatum(TC_DATUM);  // Anchor strings by top center
+
+  // Top Row Header Labels (Sitting 52px above gauge centers)
+  tft.drawString(strProgress, PROG_X, TOP_ROW_Y - 52, 2);
+  tft.drawString(strBed, BED_X, TOP_ROW_Y - 52, 2);
+  tft.drawString("Chamber", CHMBR_X, TOP_ROW_Y - 52, 2);  // Dynamic "CAV/CHMBR" area
+
+  // Bottom Row Header Labels
+  tft.drawString("N1", N1_X, NOZ_ROW_Y + 30, 2);
+  tft.drawString("N2", N2_X, NOZ_ROW_Y + 30, 2);
+  tft.drawString("N3", N3_X, NOZ_ROW_Y + 30, 2);
+  tft.drawString("N4", N4_X, NOZ_ROW_Y + 30, 2);
 }
 
 // ============================================================
-//  GAUGE DRAW
+//  GAUGE DRAW (UPDATED GRID LAYOUT & VALUE TRACKING)
 // ============================================================
 void handleGauge(uint8_t whichGauge, int16_t gaugeValue) {
   float temp;
   uint16_t theMove;
-  tft.setTextDatum(MC_DATUM);
+
+  // Set common text rendering options before the switch-case to clean up code
+  tft.loadFont(AA_FONT_SMALL, LittleFS); // Optional: if using smooth fonts for gauges
+  tft.setTextDatum(MC_DATUM);            // Force strict center-middle alignment
+  tft.setTextPadding(38);                // ── AUTOWIPE CONTAINER (Covers the inner circle)
 
   switch (whichGauge) {
-    case nozzleGauge:
-      temp = (float(gaugeValue) / maxNozzleTemp);
+    case nozzleGauge: // Nozzle 1
+      temp = (float(gaugeValue) / maxNozzleTemps[0]);
       theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.drawSmoothArc(40, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      tft.fillCircle(40, gaugeY, 20, TFT_BLACK);
-      tft.setTextColor((nozzleTarget != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), 40, dataY, 2);
+      tft.drawSmoothArc(N1_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N1_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
+      tft.setTextColor((nozzleTargets[0] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), N1_X, NOZ_ROW_Y - 2); 
       break;
 
-    case progressGauge:
-      temp = (float(gaugeValue) / 100);
+    case progressGauge: // Progress Ring
+      if (gaugeValue < 0) gaugeValue = 0;
+      if (gaugeValue > 100) gaugeValue = 100;
+      temp = (float(gaugeValue) / 100.0);
       theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (theMove > 40) {
-        tft.drawSmoothArc(120, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      }
-      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (theMove > 40) tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue) + "%", 120, dataY, 2);
+      tft.drawString(String(gaugeValue) + "%", PROG_X, TOP_ROW_Y - 2);
       break;
 
-    case bedGauge:
+    case bedGauge: // Heated Bed
       temp = (float(gaugeValue) / maxBedTemp);
       theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.drawSmoothArc(200, gaugeY, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      tft.fillCircle(200, gaugeY, 20, TFT_BLACK);
+      tft.drawSmoothArc(BED_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(BED_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
       tft.setTextColor((bedTarget != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), 200, dataY, 2);
+      tft.drawString(String(gaugeValue), BED_X, TOP_ROW_Y - 2);
+      break;
+
+    case nozzle2Gauge: // Nozzle 2
+      temp = (float(gaugeValue) / maxNozzleTemps[1]);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(N2_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N2_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
+      tft.setTextColor((nozzleTargets[1] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), N2_X, NOZ_ROW_Y - 2);
+      break;
+
+    case nozzle3Gauge: // Nozzle 3
+      temp = (float(gaugeValue) / maxNozzleTemps[2]);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(N3_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N3_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
+      tft.setTextColor((nozzleTargets[2] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), N3_X, NOZ_ROW_Y - 2);
+      break;
+
+    case nozzle4Gauge: // Nozzle 4
+      temp = (float(gaugeValue) / maxNozzleTemps[3]);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(N4_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N4_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
+      tft.setTextColor((nozzleTargets[3] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue), N4_X, NOZ_ROW_Y - 2);
+      break;
+
+    case 7: // Cavity / Chamber Ambient Gauge
+      if (gaugeValue < 0) gaugeValue = 0;
+      if (gaugeValue > 100) gaugeValue = 100;
+      temp = (float(gaugeValue) / 100.0);
+      theMove = (temp * 280) + 40;
+      tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+      
+      // ── REMOVED fillCircle ──
+      tft.setTextColor((chamberTarget > 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
+      tft.drawString(String(gaugeValue) + "C", CHMBR_X, TOP_ROW_Y - 2);
       break;
   }
+
+  tft.setTextPadding(0); // Reset padding block allocation
+  tft.unloadFont();      // Close font driver cleanly
 }
 
 // ============================================================
 //  RGB LED
 // ============================================================
-void setRGB(bool redLevel, bool greenLevel, bool blueLevel) {
+void setRGB(bool redLevel, bool blueLevel, bool greenLevel) {
   digitalWrite(RED_PIN, !redLevel);
   digitalWrite(GREEN_PIN, !greenLevel);
   digitalWrite(BLUE_PIN, !blueLevel);
@@ -436,22 +532,32 @@ void setRGB(bool redLevel, bool greenLevel, bool blueLevel) {
 // ============================================================
 void handlePrinterOffLine() {
   if (printerName == "") {
+    setRGB(1, 0, 0);
     if (showSleep == false) {
-      tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
-      drawBmp(LittleFS, OFFLINE_IMAGE, 27, belowClockY + 4);
-      String ipaddress = "KlippyMon " + WiFi.localIP().toString();
+      // Clear up to the full width of  3.5" display (319)
+      tft.fillRect(0, belowClockY, SCREEN_W - 1, SCREEN_H - belowClockY, TFT_BLACK);
+
+      // Center the offline bitmap asset relative to the 320px layout width
+      drawBmp(LittleFS, OFFLINE_IMAGE, 67, belowClockY + 15);
+
+      // Construct your configuration URL string
+      String ipaddress = "Config URL: http://" + WiFi.localIP().toString();
+
+      // Render text alignment safely inside the active lower panel workspace (Y = 415)
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.setTextDatum(BC_DATUM);
-      tft.drawString(ipaddress, 120, versionY - 16, 2);
-      drawVersionString();  // programmer info
+      tft.drawString(ipaddress, 160, 415, 2);  // Centered at horizontal mark 160
+
+      drawVersionString();  // Render programmer information
       showSleep = true;
     }
   } else {
-    tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
+    setRGB(0, 1, 0);
+    tft.fillRect(0, belowClockY, SCREEN_W - 1, SCREEN_H - belowClockY, TFT_BLACK);
     tft.loadFont(AA_FONT_SMALL, LittleFS);
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
     tft.setTextDatum(BC_DATUM);
-    tft.drawString(printerName, 120, printerNameY);
+    tft.drawString(printerName, 160, printerNameY);
     tft.unloadFont();
     handleGaugeHeadings();
     handlePrinterStatus();
@@ -473,7 +579,7 @@ void beginHTTP(HTTPClient &http, const String &url) {
 // ============================================================
 void handleHostName() {
   if (WiFi.status() == WL_CONNECTED) {
-    setRGB(0, greenON, 0);
+    setRGB(0, 1, 0);
     HTTPClient http;
     beginHTTP(http, printerURLInfo);
     int httpCode = http.GET();
@@ -487,13 +593,18 @@ void handleHostName() {
       }
     }
     http.end();
-    setRGB(0, greenOFF, 0);
+  //  setRGB(1, 0, 0);
+
     if (printerName != "") {
+      setRGB(0, 1, 0);
       fetchPrinterLimits();
       buildPrinterURLs();
-      lastBedTemp = 0;
-      lastNozzleTemp = 0;
-      lastProgress = 0;
+
+      // Set all nozzle history tracking limits to out-of-bounds variables
+      // to instantly trip the drawing functions on the very first update loop
+      for (int i = 0; i < 4; i++) {
+        lastNozzleTemps[i] = 999;
+      }
     }
   }
 }
@@ -502,53 +613,59 @@ void handleHostName() {
 //  PHASE 1 — FETCH & PARSE
 // ============================================================
 bool fetchPrinterData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi lost");
-    return false;
-  }
-  setRGB(0, greenON, 0);
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  printState = "";
+
+  setRGB(0, 0, 1);
   HTTPClient http;
   beginHTTP(http, printerURLQ);
   int httpCode = http.GET();
-
   if (httpCode != 200) {
     http.end();
-    setRGB(0, greenOFF, 0);
+    setRGB(1, 0, 0);
     return false;
   }
 
   String payload = http.getString();
   http.end();
-  setRGB(0, greenOFF, 0);
+  setRGB(0, 1, 0);
 
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-    Serial.println("JSON Error");
-    return false;
-  }
+  if (error) return false;
 
-  nozzleTarget = doc["result"]["status"]["extruder"]["target"] | 0.0;
+  // Primary telemetry values
   bedTarget = doc["result"]["status"]["heater_bed"]["target"] | 0.0;
-  printState = doc["result"]["status"]["print_stats"]["state"] | "unknown";
-  nozzleTemp = doc["result"]["status"]["extruder"]["temperature"] | 0.0;
   bedTemp = doc["result"]["status"]["heater_bed"]["temperature"] | 0.0;
+  printState = doc["result"]["status"]["print_stats"]["state"] | "unknown";
   printDuration = doc["result"]["status"]["print_stats"]["print_duration"] | 0.0;
   totalDuration = doc["result"]["status"]["print_stats"]["total_duration"] | 0.0;
   if (totalDuration > 0) savedTotalDuration = totalDuration;
   progress = doc["result"]["status"]["display_status"]["progress"] | 0.0;
 
-  if (thePrintFile == "" && printState != "standby") {
+  // Explicit Floating Point Mapping for ArduinoJson v7
+  nozzleTargets[0] = doc["result"]["status"]["extruder"]["target"].as<float>();
+  nozzleTemps[0] = doc["result"]["status"]["extruder"]["temperature"].as<float>();
+
+  nozzleTargets[1] = doc["result"]["status"]["extruder1"]["target"].as<float>();
+  nozzleTemps[1] = doc["result"]["status"]["extruder1"]["temperature"].as<float>();
+
+  nozzleTargets[2] = doc["result"]["status"]["extruder2"]["target"].as<float>();
+  nozzleTemps[2] = doc["result"]["status"]["extruder2"]["temperature"].as<float>();
+
+  nozzleTargets[3] = doc["result"]["status"]["extruder3"]["target"].as<float>();
+  nozzleTemps[3] = doc["result"]["status"]["extruder3"]["temperature"].as<float>();
+
+  chamberTemp = doc["result"]["status"][chamberSensorName.c_str()]["temperature"] | 0.0;
+  chamberTarget = doc["result"]["status"][chamberSensorName.c_str()]["target"] | 0.0;
+
+  if ((thePrintFile == "" || forcePoll) && printState != "standby") {
     String rawPath = doc["result"]["status"]["print_stats"]["filename"] | "";
     if (rawPath != "") {
       thePrintFileRaw = rawPath;
       thePrintFile = extractFileName(rawPath, false);
     }
-  }
-
-  if (hasChamber) {
-    chamberTemp = doc["result"]["status"][chamberSensorName.c_str()]["temperature"] | 0.0;
-    chamberTarget = doc["result"]["status"][chamberSensorName.c_str()]["target"] | 0.0;
   }
 
   return true;
@@ -561,43 +678,22 @@ void fetchPrinterLimits() {
   HTTPClient http;
   beginHTTP(http, "http://" + printerIP + ":" + printerPort + "/printer/objects/query?configfile");
   int httpCode = http.GET();
-  if (httpCode == 200) {
-    String payload = http.getString();
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if (!error) {
-      String nozzle = doc["result"]["status"]["configfile"]["config"]["extruder"]["max_temp"] | "350";
-      String bed = doc["result"]["status"]["configfile"]["config"]["heater_bed"]["max_temp"] | "120";
-      maxNozzleTemp = nozzle.toInt();
-      maxBedTemp = bed.toInt();
-      writeSettings();
-    } else {
-      Serial.println("fetchPrinterLimits JSON error");
-    }
-  } else {
-    Serial.printf("fetchPrinterLimits failed: %d\n", httpCode);
-  }
-  http.end();
 
-  // ── Chamber detection ─────────────────────────────────────
-  beginHTTP(http, "http://" + printerIP + ":" + printerPort + "/printer/objects/list");
-  httpCode = http.GET();
   if (httpCode == 200) {
     String payload = http.getString();
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
+
     if (!error) {
-      hasChamber = false;
-      chamberSensorName = "";
-      JsonArray objects = doc["result"]["objects"].as<JsonArray>();
-      for (JsonVariant obj : objects) {
-        String name = obj.as<String>();
-        if (name == "heater_generic hot" || name == "heater_generic chamber" || name == "heater_generic Chamber" || name == "temperature_sensor chamber" || name == "temperature_sensor Chamber" || name == "temperature_sensor chamber_temp") {
-          chamberSensorName = name;
-          hasChamber = true;
-          break;
-        }
-      }
+      // Direct assignment with integer fallbacks (compatible with ArduinoJson v7)
+      maxNozzleTemps[0] = doc["result"]["status"]["configfile"]["config"]["extruder"]["max_temp"] | 350;
+      maxNozzleTemps[1] = doc["result"]["status"]["configfile"]["config"]["extruder1"]["max_temp"] | 350;
+      maxNozzleTemps[2] = doc["result"]["status"]["configfile"]["config"]["extruder2"]["max_temp"] | 350;
+      maxNozzleTemps[3] = doc["result"]["status"]["configfile"]["config"]["extruder3"]["max_temp"] | 350;
+
+      maxBedTemp = doc["result"]["status"]["configfile"]["config"]["heater_bed"]["max_temp"] | 120;
+
+      writeSettings();
     }
   }
   http.end();
@@ -612,20 +708,31 @@ void handleTimeUsed() {
   int hrs = totalSecs / 3600;
   int mins = (totalSecs % 3600) / 60;
 
-  tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+  // ── TARGETED ONCE-ONLY DRAWS ──
+  // These clear boxes are perfectly fine here because handleTimeUsed only executes 
+  // ONCE at the exact moment the print drops into complete state.
+  tft.fillRect(0, 385, SCREEN_W - 1, 30, TFT_BLACK);   
+  tft.fillRect(0, filenameY - 15, SCREEN_W - 1, 30, TFT_BLACK); 
+
   drawBmp(LittleFS, SUCCESS_IMAGE, graphicX, graphicY);
 
   tft.loadFont(AA_FONT_SMALL, LittleFS);
-  tft.setTextDatum(BC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM); 
+  tft.setTextPadding(SCREEN_W - 10); // Safe stable background container
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  
   if (hrs != 0) {
     sprintf(buffer, "%s: %1u:%02u %s", strTotal, hrs, mins, strHrs);
   } else {
     sprintf(buffer, "%s: %u %s", strTotal, mins, strMins);
   }
-  tft.drawString(buffer, 120, endTimeY);
+  
+  tft.drawString(buffer, SCREEN_W / 2, 405); 
+  
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(thePrintFile, 120, filenameY);
+  tft.drawString(thePrintFile, SCREEN_W / 2, filenameY); 
+  
+  tft.setTextPadding(0); 
   tft.unloadFont();
 
   justFinished = true;
@@ -658,85 +765,82 @@ void handleETA() {
     activeETA = false;
     return;
   }
+
   char timeLeft[24];
   uint16_t pct = uint16_t(progress * 100);
-  if (pct > lastProgress) {
-    lastProgress = pct;
-    estimateTimeRemaining(printDuration, pct, timeLeft);
 
-    // Build the end time string
-    time_t utc = now();
-    time_t localTime = timeZoneRule.toLocal(utc, &tcr);
-    time_t addSeconds = ((time_t)etaHH * 3600) + ((time_t)etaMM * 60);
-    time_t futureTime = localTime + addSeconds;
-    uint8_t theHour = (show24HR) ? hour(futureTime) : hourFormat12(futureTime);
-    uint8_t theMinute = minute(futureTime);
-    bool nextDay = (hour(futureTime) < hour(localTime) && etaHH > 0);
+  estimateTimeRemaining(printDuration, pct, timeLeft);
 
-    char endStr[50];
+  time_t utc = now();
+  time_t localTime = timeZoneRule.toLocal(utc, &tcr);
+  unsigned long currentLocalSecs = (hour(localTime) * 3600UL) + (minute(localTime) * 60UL) + second(localTime);
+  unsigned long remainingSecs = ((unsigned long)etaHH * 3600UL) + ((unsigned long)etaMM * 60UL);
+  unsigned long endLocalSecs = currentLocalSecs + remainingSecs;
 
-    if (!show24HR) {
-      const char *ampm = (hour(futureTime) >= 12) ? "PM" : "AM";
-      if (nextDay) {
-        sprintf(endStr, "ETA: %s  -  FPT: %u:%02u %s", timeLeft, theHour, theMinute, ampm);
-      } else {
-        sprintf(endStr, "ETA: %s  -  FPT: %u:%02u %s", timeLeft, theHour, theMinute, ampm);
-      }
-    } else {
-      sprintf(endStr, "ETA: %s  -  FPT: %u:%02u", timeLeft, theHour, theMinute);
-    }
+  uint8_t endMin = (endLocalSecs / 60UL) % 60UL;
+  uint8_t endHr = (endLocalSecs / 3600UL) % 24UL;
+  uint8_t ampmHr = endHr % 12;
+  if (ampmHr == 0) ampmHr = 12;
 
-    tft.loadFont(AA_FONT_SMALL, LittleFS);
-    tft.setTextDatum(BC_DATUM);
-    tft.fillRect(0, endTimeY - 16, 239, 18, TFT_BLACK);
-
-    if (nextDay) {
-      // Draw ETA part in white
-      char etaPart[40];
-      sprintf(etaPart, "ETA: %s  -  FPT: ", timeLeft);
-      char endPart[16];
-      if (!show24HR) {
-        const char *ampm = (hour(futureTime) >= 12) ? "PM" : "AM";
-        sprintf(endPart, "%u:%02u %s", theHour, theMinute, ampm);
-      } else {
-        sprintf(endPart, "%u:%02u", theHour, theMinute);
-      }
-      // Measure ETA part width to position End part
-      int16_t etaWidth = tft.textWidth(etaPart);
-      int16_t totalWidth = etaWidth + tft.textWidth(endPart);
-      int16_t startX = 120 - (totalWidth / 2);
-      tft.setTextDatum(BL_DATUM);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(etaPart, startX, endTimeY);
-      tft.setTextColor(TFT_RED, TFT_BLACK);
-      tft.drawString(endPart, startX + etaWidth, endTimeY);
-    } else {
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(endStr, 120, endTimeY);
-    }
-
-    tft.unloadFont();
-    activeETA = true;
+  char endStr[32];
+  if (show24HR) {
+    snprintf(endStr, sizeof(endStr), "Ends: %02u:%02u  (%s %s)", endHr, endMin, timeLeft, strHrs);
+  } else {
+    snprintf(endStr, sizeof(endStr), "Ends: %u:%02u %s  (%s %s)", ampmHr, endMin, (endHr >= 12) ? "PM" : "AM", timeLeft, strHrs);
   }
+
+  tft.loadFont(AA_FONT_SMALL, LittleFS);
+
+  // Force strict Middle-Center alignment for both text tracks
+  tft.setTextDatum(MC_DATUM);
+
+  // Wipe only the precise character width box using text padding to eliminate background flashing
+  tft.setTextPadding(SCREEN_W - 10);
+
+  // Draw ETA Row at Y=405
+  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+  tft.drawString(endStr, SCREEN_W / 2, 405);
+
+  // Draw Filename Row at Y=435 (Perfect horizontal center alignment at 160px)
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawString(thePrintFile, SCREEN_W / 2, filenameY);
+
+  tft.setTextPadding(0);  // Reset padding configuration
+  tft.unloadFont();
+  activeETA = true;
 }
+
+
 // ============================================================
 //  PHASE 2 — DETERMINE STATE
 // ============================================================
 PrinterState determinePrinterState() {
   lastState = currentState;
-
-  if (printState == "standby") {
+  if (printState == "printing") {
+    currentState = STATE_PRINTING;
+  } else if (printState == "paused") {
+    currentState = STATE_PREP;
+  } else if (printState == "complete") {
+    currentState = STATE_COMPLETE;
+  } else if (printState == "ready") {
+    currentState = STATE_IDLE;
+  } else if (printState == "cancelled") {
+    // ── DIRECT TRANSITION EDGE TRIGGER ──
+    // If a job is actively stopped or cancelled mid-print,
+    // immediately transition straight into IDLE mode layout
+    currentState = STATE_IDLE;
+  } else if (printState == "standby") {
+    // Look backward: if we were printing or prepping, a transition to standby means complete!
     if (lastState == STATE_PRINTING || lastState == STATE_PREP) {
-      return STATE_COMPLETE;
+      currentState = STATE_COMPLETE;
+    } else {
+      currentState = STATE_IDLE;
     }
-    return STATE_IDLE;
+  } else {
+    // Only default to PREP if explicitly initializing, calibrating, or heating
+    currentState = STATE_PREP;
   }
-
-  if (printDuration == 0.0) {
-    return STATE_PREP;
-  }
-
-  return STATE_PRINTING;
+  return currentState;
 }
 
 // ============================================================
@@ -745,7 +849,15 @@ PrinterState determinePrinterState() {
 void updatePrinterDisplay(PrinterState state) {
   tft.setTextDatum(MC_DATUM);
 
-  // Always update temperature gauges
+  // ── STATE TRANSITION EDGE TRIGGER ──
+  // If the printer state has changed since the last execution cycle,
+  // drop layout blocks so the target state is allowed to draw its unique asset!
+  if (state != lastState) {
+    showIdle = false;
+    justFinished = false;
+  }
+
+  // Always update temperature gauges (Original Core Structure)
   if (round(nozzleTemp) != lastNozzleTemp) {
     lastNozzleTemp = round(nozzleTemp);
     handleGauge(nozzleGauge, lastNozzleTemp);
@@ -756,29 +868,38 @@ void updatePrinterDisplay(PrinterState state) {
   }
 
   switch (state) {
-
     case STATE_IDLE:
-      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.fillCircle(PROG_X, TOP_ROW_Y, 20, TFT_BLACK);
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(strIdle, 120, dataY, 2);
-      if (!showIdle && !justFinished) {
-        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+      tft.drawString(strIdle, PROG_X, TOP_ROW_Y, 2);
+
+      // ── NEW SCREEN CLEANING GATE ──
+      // When showIdle is false, it means we have JUST transitioned into Idle mode.
+      // We clear the text space completely before drawing the idle image asset.
+      if (!showIdle) {
+        // Clear the exact text lanes below the BMP area (Y=385 to Y=460)
+        // This instantly drops the old ETA, Total Print Time, and Green Filename
+        tft.fillRect(0, 385, SCREEN_W - 1, 75, TFT_BLACK);
+
+        // Draw your standard idle screen bitmap graphic
+        tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
         drawBmp(LittleFS, IDLE_IMAGE, graphicX + 7, graphicY + 7);
-        // ──  (fake data for layout test goes here) ──
-        showIdle = true;
+
+        showIdle = true;  // Lock out until the next state change
       }
       activeETA = false;
       break;
 
     case STATE_PREP:
-      tft.drawSmoothArc(120, gaugeY, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.fillCircle(120, gaugeY, 20, TFT_BLACK);
+      tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.fillCircle(PROG_X, TOP_ROW_Y, 20, TFT_BLACK);
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(strPrep, 120, dataY, 2);
+      tft.drawString(strPrep, PROG_X, TOP_ROW_Y, 2);
+
       if (!showIdle) {
-        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
-        drawBmp(LittleFS, HEATING_IMAGE, graphicX, graphicY);
+        tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
+        drawBmp(LittleFS, HEATING_IMAGE, graphicX + 7, graphicY + 7);
         showIdle = true;
       }
       activeETA = false;
@@ -787,43 +908,40 @@ void updatePrinterDisplay(PrinterState state) {
     case STATE_PRINTING:
       showIdle = false;
       justFinished = false;
-      // Serial.println("STATE_PRINTING - lastState: " + String(lastState) + " thePrintFile: " + thePrintFile);
-      if (thePrintFile != "" && lastState != STATE_PRINTING) {
-        // Serial.println("Thumbnail block firing - lastState: " + String(lastState));
-        // Serial.println("thePrintFile on reconnect: " + thePrintFile);
+
+      // Runs once when an edge trigger signals a brand new print initialization frame
+      if (thePrintFile != "" && (lastState != STATE_PRINTING || forcePoll)) {
         ntfyResetForNewPrint();
-        tft.fillRect(0, statusZoneY, 239, statusZoneH, TFT_BLACK);
+
+        // Clear the entire lower layout quadrant once at start (Y=250 down to bottom)
+        tft.fillRect(0, statusZoneY, SCREEN_W - 1, SCREEN_H - statusZoneY, TFT_BLACK);
+
         if (!fetchAndDrawThumbnail()) {
           drawBmp(LittleFS, PRINTING_IMAGE, graphicX + 7, graphicY + 7);
         }
-        tft.loadFont(AA_FONT_SMALL, LittleFS);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.setTextDatum(BC_DATUM);
-        tft.fillRect(0, filenameY - 14, 239, 16, TFT_BLACK);  // clear filename line
-        tft.drawString(thePrintFile, 120, filenameY);
-        tft.unloadFont();
-        handleGauge(progressGauge, 0);  // ← start at 0% immediately
-        lastProgress = 0;               // ← force redraw on first real progress
+
+        // Force an immediate layout calculation pass
+        handleGauge(progressGauge, 0);
+        lastProgress = 0;
       }
 
       progressPercent = uint16_t(progress * 100.0);
-      if (progressPercent != lastProgress) {
+      if (progressPercent != lastProgress || forcePoll) {
         lastProgress = progressPercent;
         handleGauge(progressGauge, lastProgress);
-      }
-      ntfyCheckStall(progress);  // was progressPercent
 
-      // ── Chamber temp ──────────────────────────────────────
-      if (hasChamber) {
-        tft.loadFont(AA_FONT_SMALL, LittleFS);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.drawString("CHMBR", chamberX, chamberY);
-        tft.fillRect(0, chamberY + 6, 63, 18, TFT_BLACK);  // clear number line only
-        tft.setTextColor((chamberTarget > 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-        tft.drawString(String((int)chamberTemp) + "C", chamberX, chamberY + 18);
-        tft.unloadFont();
+        if (printState == "paused") {
+          tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
+          drawBmp(LittleFS, HEATING_IMAGE, graphicX + 7, graphicY + 7);
+        } else if (thumbBuffer != NULL) {
+          fetchAndDrawThumbnail();
+        }
+
+        // This executes your newly aligned text and centers everything dynamically
+        handleETA();
       }
+
+      ntfyCheckStall(progress);
       break;
 
     case STATE_COMPLETE:
@@ -831,41 +949,60 @@ void updatePrinterDisplay(PrinterState state) {
       handleGauge(progressGauge, 0);
 
       if (thePrintFile != "") {
-        ntfyPrintComplete(thePrintFileRaw, savedTotalDuration);  // send notification
+        ntfyPrintComplete(thePrintFileRaw, savedTotalDuration);  // Send alert push
         tft.fillRect(0, filenameY - 14, 239, 16, TFT_BLACK);
-        handleTimeUsed();
+        handleTimeUsed();  // Original statistical page drawing layout manager
       }
       thePrintFile = "";
+
+      // Clear layout lockout flags completely so STATE_IDLE renders its assets
       showIdle = true;
       activeETA = false;
       break;
   }
 }
-
 // ============================================================
 //  handlePrinterStatus
 // ============================================================
 void handlePrinterStatus() {
-  static uint8_t failCount = 0;
+  if (fetchPrinterData()) {
+    currentState = determinePrinterState();
 
-  if (!fetchPrinterData()) {
-    failCount++;
-    Serial.println("fetchPrinterData failed - count: " + String(failCount));
-    if (failCount >= 3) {  // 3 consecutive failures (~30 seconds) before giving up
-      failCount = 0;
-      printerName = "";
-      tft.fillRect(0, belowClockY, 239, SCREEN_H - belowClockY, TFT_BLACK);
-      drawVersionString();
+    // Trigger full baseline layout paint if state snaps or updates require force refresh
+    if (forcePoll || lastState != currentState || showSleep) {
+      tft.fillRect(0, clockBottomY + 25, SCREEN_W - 1, (statusZoneY - (clockBottomY + 25)), TFT_BLACK);
+      handleGaugeHeadings();
       showSleep = false;
-      showIdle = false;
     }
-    return;
-  }
 
-  failCount = 0;  // reset on success
-  currentState = determinePrinterState();
-  updatePrinterDisplay(currentState);
-  handleETA();
+    // Pass down core telemetry blocks to updatePrinterDisplay
+    updatePrinterDisplay(currentState);
+
+    // ── Unified 3-Over-4 Layout Rendering Pipeline ──
+    // Bottom Row (Nozzles)
+    handleGauge(nozzleGauge, round(nozzleTemps[0]));
+    handleGauge(nozzle2Gauge, round(nozzleTemps[1]));
+    handleGauge(nozzle3Gauge, round(nozzleTemps[2]));
+    handleGauge(nozzle4Gauge, round(nozzleTemps[3]));
+
+    // Top Row (Bed and Progress)
+    handleGauge(bedGauge, round(bedTemp));
+    uint16_t currentProgressInt = (uint16_t)(progress * 100.0);
+    handleGauge(progressGauge, currentProgressInt);
+
+    // Top Row (Chamber/Cavity Gauge) - Active across Standby, Prep, and Printing
+    if (hasChamber) {
+      handleGauge(7, round(chamberTemp));  // Calls ID 7 to draw the third upper circle
+    } else {
+      // Clear the right column space with a gray blank ring if Klipper connection drops
+      tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+      tft.fillCircle(CHMBR_X, TOP_ROW_Y, 20, TFT_BLACK);
+    }
+
+  } else {
+    printerName = "";
+    handlePrinterOffLine();
+  }
 }
 
 // ============================================================
@@ -943,51 +1080,57 @@ String SendHTML() {
   String page = String(HTML_TEMPLATE);
 
   // Header
-  page.replace("%VERSION%",           String(VERSION));
-  page.replace("%WIFI_QUALITY%",      String(getWifiQuality()));
+  page.replace("%VERSION%", String(VERSION));
+  page.replace("%WIFI_QUALITY%", String(getWifiQuality()));
 
   // WiFi reset modal
-  page.replace("%WIFI_RESET_TITLE%",  String(wcWifiResetTitle));
-  page.replace("%WIFI_RESET_BODY%",   String(wcWifiResetBody));
-  page.replace("%WIFI_RESET_YES%",    String(wcWifiResetYes));
+  page.replace("%WIFI_RESET_TITLE%", String(wcWifiResetTitle));
+  page.replace("%WIFI_RESET_BODY%", String(wcWifiResetBody));
+  page.replace("%WIFI_RESET_YES%", String(wcWifiResetYes));
   page.replace("%WIFI_RESET_CANCEL%", String(wcWifiResetCancel));
-  page.replace("%WIFI_RESET_BTN%",    String(wcWifiResetBtn));
+  page.replace("%WIFI_RESET_BTN%", String(wcWifiResetBtn));
 
   // Section headings
-  page.replace("%SEC_PRINTER%",       String(wcSecPrinter));
-  page.replace("%SEC_NTFY%",          String(wcSecNtfy));
-  page.replace("%SEC_WIFI%",          String(wcSecWifi));
+  page.replace("%SEC_PRINTER%", String(wcSecPrinter));
+  page.replace("%SEC_NTFY%", String(wcSecNtfy));
+  page.replace("%SEC_WIFI%", String(wcSecWifi));
 
   // Printer setup block
-  page.replace("%PRINTER_SETUP%",     getPrinterSetup());
+  page.replace("%PRINTER_SETUP%", getPrinterSetup());
 
   // Ntfy labels
-  page.replace("%NTFY_ENABLED%",      String(wcNtfyEnabled));
-  page.replace("%NTFY_SERVER%",       String(wcNtfyServer));
-  page.replace("%NTFY_PORT%",         String(wcNtfyPort));
-  page.replace("%NTFY_TOPIC%",        String(wcNtfyTopic));
-  page.replace("%NTFY_TOKEN%",        String(wcNtfyToken));
-  page.replace("%NTFY_STALL_MIN%",    String(wcNtfyStallMin));
+  page.replace("%NTFY_ENABLED%", String(wcNtfyEnabled));
+  page.replace("%NTFY_SERVER%", String(wcNtfyServer));
+  page.replace("%NTFY_PORT%", String(wcNtfyPort));
+  page.replace("%NTFY_TOPIC%", String(wcNtfyTopic));
+  page.replace("%NTFY_TOKEN%", String(wcNtfyToken));
+  page.replace("%NTFY_STALL_MIN%", String(wcNtfyStallMin));
 
   // Ntfy values
   page.replace("%NTFY_ENABLED_CHECKED%", ntfyEnabled ? " checked" : "");
-  page.replace("%NTFY_SERVER_VAL%",   ntfyServerDisplay());
-  page.replace("%NTFY_PORT_VAL%",     ntfyPort);
-  page.replace("%NTFY_TOPIC_VAL%",    ntfyTopic);
-  page.replace("%NTFY_TOKEN_VAL%",    ntfyToken);
+  page.replace("%NTFY_SERVER_VAL%", ntfyServerDisplay());
+  page.replace("%NTFY_PORT_VAL%", ntfyPort);
+  page.replace("%NTFY_TOPIC_VAL%", ntfyTopic);
+  page.replace("%NTFY_TOKEN_VAL%", ntfyToken);
   page.replace("%NTFY_STALL_MIN_VAL%", String(ntfyStallMin));
 
   // Save button
-  page.replace("%SAVE_BTN%",          String(wcSaveBtn));
+  page.replace("%SAVE_BTN%", String(wcSaveBtn));
 
   return page;
 }
 
+// ============================================================
+//  FIXED WEB SERVER CONFIGURATION UPDATE ROUTINE
+// ============================================================
 void handlePrinterUpdate() {
+  // 1. Parse Primary Web Form Parameters
   if (server.hasArg("printerIP")) printerIP = server.arg("printerIP");
   if (server.hasArg("printerPort")) printerPort = server.arg("printerPort");
   show24HR = server.hasArg("show24HR");
   ntfyEnabled = server.hasArg("ntfyEnabled");
+
+  // 2. Restore Ntfy Push Notification Form Parsers
   if (server.hasArg("ntfyServer")) {
     ntfyServer = server.arg("ntfyServer");
     ntfyServer.trim();
@@ -1004,9 +1147,11 @@ void handlePrinterUpdate() {
     ntfyToken = server.arg("ntfyToken");
     ntfyToken.trim();
   }
-  if (server.hasArg("ntfyStallMin")) ntfyStallMin = server.arg("ntfyStallMin").toInt();
+  if (server.hasArg("ntfyStallMin")) {
+    ntfyStallMin = server.arg("ntfyStallMin").toInt();
+  }
 
-  // Build the full ntfy URL
+  // 3. Reconstruct full ntfy Endpoint URL Structs
   if (!ntfyServer.startsWith("http://") && !ntfyServer.startsWith("https://")) {
     bool isIP = true;
     for (char c : ntfyServer) {
@@ -1015,23 +1160,37 @@ void handlePrinterUpdate() {
         break;
       }
     }
-    ntfyServer = isIP ? "http://" + ntfyServer + ":" + ntfyPort
-                      : "https://" + ntfyServer;
+    ntfyServer = isIP ? "http://" + ntfyServer + ":" + ntfyPort : "https://" + ntfyServer;
   }
 
-  writeSettings();  // ← everything is set before we save
+  // 4. Save everything to LittleFS before building endpoints
+  writeSettings();
+  buildPrinterURLs();
 
-  // Reset display
-  tft.fillRect(0, clockBottomY, 239, SCREEN_H - clockBottomY, TFT_BLACK);
+  // 5. Secure Screen Reversion Reset (Upgraded to fill full width SCREEN_W)
+  tft.fillRect(0, clockBottomY + 25, SCREEN_W - 1, (SCREEN_H - (clockBottomY + 25)), TFT_BLACK);
   drawVersionString();
   printerName = "";
   showSleep = false;
   showIdle = false;
   justFinished = false;
-  currentState = STATE_IDLE;
-  lastState = STATE_IDLE;
+
+  // 6. Intelligent State Gate Check (Keeps live prints from breaking mid-save)
+  if (printState != "printing" && printState != "paused") {
+    foundPrinter = false;
+    currentState = STATE_IDLE;
+    lastState = STATE_IDLE;
+  } else {
+    // If running, keep state locked to printing so it doesn't break the layout loop
+    currentState = STATE_PRINTING;
+    lastState = STATE_PRINTING;
+  }
+
+  for (int i = 0; i < 4; i++) {
+    lastNozzleTemps[i] = 999;
+  }
+
   forcePoll = true;
-  buildPrinterURLs();
   server.send(200, "text/html", SendHTML());
 }
 
@@ -1102,15 +1261,13 @@ void readSettings() {
 }
 
 void buildPrinterURLs() {
+  hasChamber = true;
+  chamberSensorName = "temperature_sensor cavity";
   printerURLInfo = "http://" + printerIP + ":" + printerPort + printerINFO;
-  printerURLQ = "http://" + printerIP + ":" + printerPort + printQuery;
-  if (hasChamber) {
-    String encodedName = chamberSensorName;
-    encodedName.replace(" ", "+");
-    printerURLQ += "&" + encodedName;
-  }
-  // Serial.println("buildPrinterURLs hasChamber: " + String(hasChamber));
-  // Serial.println("printerURLQ: " + printerURLQ);
+  printerURLQ = "http://" + printerIP + ":" + printerPort + "/printer/objects/query?heater_bed&display_status&print_stats&extruder&extruder1&extruder2&extruder3";
+  String encodedName = chamberSensorName;
+  encodedName.replace(" ", "+");
+  printerURLQ += "&" + encodedName;
 }
 
 // ============================================================
@@ -1207,13 +1364,8 @@ String extractFileName(const String &path, bool withExt) {
 //  WIFI RESET
 // ============================================================
 void handleWifiReset() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("WiFi reset in 5 seconds", SCREEN_W / 2, SCREEN_H / 2, 2);
-  delay(5000);
-  redirectHome();
-  delay(1000);
+  server.send(200, "text/html", "<html><body><h2>WiFi Config Cleared.</h2><p>Device restarting... Reconnect to its Access Point hotspot to reconfigure.</p></body></html>");
+  delay(2000);
   WiFiManager wifiManager;
   wifiManager.resetSettings();
   ESP.restart();
@@ -1228,57 +1380,65 @@ void redirectHome() {
   server.client().stop();
 }
 
-// Called by PNGdec for each decoded row
+// ============================================================
+//  PNG RASTER DECODER CALLBACK
+// ============================================================
 int pngDraw(PNGDRAW *pDraw) {
-  uint16_t lineBuffer[110];
-  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
-  tft.pushImage(graphicX, graphicY + pDraw->y, pDraw->iWidth, 1, lineBuffer);
-  return 1;  // return 1 to continue decoding
+  uint16_t usPixels[110];  // Line buffer allocation matching the 110px width thumbnail
+
+  // Safely intercept and stop rows that exceed bounds
+  if (pDraw->y >= 110) return 0;
+
+  // Convert incoming image pixels directly to 16-bit color specs
+  png.getLineAsRGB565(pDraw, usPixels, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+
+  // Directly write the line using the active 3.5" grid positions (graphicX, graphicY)
+  tft.pushImage(graphicX, graphicY + pDraw->y, pDraw->iWidth, 1, usPixels);
+
+  return 1;
 }
 
+// ============================================================
+//  FORTIFIED THUMBNAIL NETWORK DRAW & MEMORY MONITOR
+// ============================================================
 bool fetchAndDrawThumbnail() {
+  if (thePrintFileRaw == "") return false;
 
-  // Strip extension for thumbnail lookup
-  String thumbFile = thePrintFileRaw;
-  int slashIdx = thumbFile.lastIndexOf('/');
-  if (slashIdx >= 0) thumbFile = thumbFile.substring(slashIdx + 1);
-  int dotIdx = thumbFile.lastIndexOf('.');
-  if (dotIdx > 0) thumbFile = thumbFile.substring(0, dotIdx);
+  // 1. MEMORY GUARD: Safely free up any stale heap memory before parsing new blocks
+  if (thumbBuffer != NULL) {
+    free(thumbBuffer);
+    thumbBuffer = NULL;
+  }
 
-  String encodedFile = thumbFile;
-  encodedFile.replace(" ", "%20");
-  encodedFile.replace("(", "%28");
-  encodedFile.replace(")", "%29");
-  encodedFile.replace("[", "%5B");
-  encodedFile.replace("]", "%5D");
-  encodedFile.replace("&", "%26");
+  String encodedFile = thePrintFileRaw;
   encodedFile.replace("+", "%2B");
-
   String thumbURL = "http://" + printerIP + ":" + printerPort + "/server/files/gcodes/.thumbs/" + encodedFile + "-110x110.png";
-  // Serial.println("Raw: " + thePrintFileRaw);
-  // Serial.println("Thumb file: " + thumbFile);
-  // Serial.println("Full URL: " + thumbURL);
 
+  HTTPClient httpThumb;
   httpThumb.begin(thumbURL);
   int httpCode = httpThumb.GET();
 
+  // If Klipper can't serve the file yet, fall back gracefully to your local PRINTING_IMAGE
   if (httpCode != 200) {
-    Serial.println("Thumb fetch failed: " + String(httpCode));
+    Serial.println("[DEBUG Thumb] Fetch failed, falling back to local asset. Code: " + String(httpCode));
     httpThumb.end();
+
+    // Draw default icon immediately so the screen doesn't go blank
+    tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
+    drawBmp(LittleFS, PRINTING_IMAGE, graphicX + 7, graphicY + 7);
     return false;
   }
 
   thumbBufferSize = httpThumb.getSize();
-  //Serial.println("Thumb size: " + String(thumbBufferSize) + " bytes");
-
   thumbBuffer = (uint8_t *)malloc(thumbBufferSize);
+
   if (!thumbBuffer) {
-    Serial.println("malloc failed!");
+    Serial.println("[DEBUG Thumb] Malloc failed! Device out of heap memory.");
     httpThumb.end();
     return false;
   }
 
-  // Read the PNG data into the buffer
+  // Stream data blocks sequentially from Klipper API straight into buffer
   WiFiClient *stream = httpThumb.getStreamPtr();
   int bytesRead = 0;
   while (httpThumb.connected() && bytesRead < thumbBufferSize) {
@@ -1288,21 +1448,29 @@ bool fetchAndDrawThumbnail() {
   }
   httpThumb.end();
 
-  Serial.println("Bytes read: " + String(bytesRead));
+  // Clear target graphic frame boundary background footprint safely once
+  tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
 
-  // Decode and draw
-  int rc = png.openRAM(thumbBuffer, bytesRead, pngDraw);
+  // Stream the RAM block through your pngDraw line driver callback
+  int16_t rc = png.openRAM(thumbBuffer, thumbBufferSize, pngDraw);
   if (rc == PNG_SUCCESS) {
     tft.startWrite();
     rc = png.decode(NULL, 0);
     tft.endWrite();
     png.close();
+
+    // Free memory right after a successful screen draw if we aren't caching persistently
+    free(thumbBuffer);
+    thumbBuffer = NULL;
+    return true;
   } else {
-    Serial.println("PNG open failed: " + String(rc));
+    Serial.print("[DEBUG Thumb] PNG Decode Error Code: ");
+    Serial.println(rc);
+    free(thumbBuffer);
+    thumbBuffer = NULL;
+
+    // Recovery path: fill with default printing asset if decode fails
+    drawBmp(LittleFS, PRINTING_IMAGE, graphicX + 7, graphicY + 7);
   }
-
-  free(thumbBuffer);
-  thumbBuffer = nullptr;
-
-  return (rc == PNG_SUCCESS);
+  return false;
 }
