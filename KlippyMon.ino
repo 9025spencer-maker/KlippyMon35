@@ -918,7 +918,7 @@ void updatePrinterDisplay(PrinterState state) {
         // Clear the exact text lanes below the BMP area (Y=385 to Y=460)
         // This instantly drops the old ETA, Total Print Time, and Green Filename
         tft.fillRect(0, 385, SCREEN_W - 1, 75, TFT_BLACK);
-
+        invalidateAllGauges();
         // Draw your standard idle screen bitmap graphic
         tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
         drawBmp(LittleFS, IDLE_IMAGE, graphicX + 7, graphicY + 7);
