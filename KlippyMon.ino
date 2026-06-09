@@ -175,6 +175,7 @@ int pngDraw(PNGDRAW *pDraw);
 void fetchPrinterLimits();                            // get the printers default limits
 String ntfyServerDisplay();                           // cleans up the URL for local host server
 void beginHTTP(HTTPClient &http, const String &url);  // timeouts for http
+uint16_t lastChamberTemp = 999;
 
 // ============================================================
 //  VERSION STRING
@@ -418,104 +419,119 @@ void handleGaugeHeadings() {
   tft.drawString("N3", N3_X, NOZ_ROW_Y + 30, 2);
   tft.drawString("N4", N4_X, NOZ_ROW_Y + 30, 2);
 }
+// ============================================================
+//  Gauge Render
+// ============================================================
+void drawGaugeCore(
+  int16_t x,
+  int16_t y,
+  int16_t value,
+  int16_t maxValue,
+  uint16_t activeColor,
+  bool isActive,
+  const String &label,
+  bool showPercent = false) {
+  // Clamp value
+  if (value < 0) value = 0;
+  if (value > maxValue) value = maxValue;
 
+  float temp = (float)value / maxValue;
+  uint16_t theMove = (temp * 280) + 40;
+
+  // Base arc
+  tft.drawSmoothArc(x, y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
+
+  // Active arc
+  if (value > 0 && theMove > 40) {
+    tft.drawSmoothArc(x, y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
+  }
+
+  // Inner circle
+  tft.fillCircle(x, y, 20, TFT_BLACK);
+
+  // Text
+  tft.setTextPadding(0);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(isActive ? activeColor : TFT_WHITE, TFT_BLACK);
+
+  if (showPercent) {
+    tft.drawString(String(value) + "%", x, y - 2, 2);
+  } else if (label.length() > 0) {
+    tft.drawString(label, x, y - 2, 2);
+  } else {
+    tft.drawString(String(value), x, y - 2, 2);
+  }
+}
+
+// ============================================================
+//  Draw Temp Gauge
+// ============================================================
+void drawTempGauge(
+  int16_t x,
+  int16_t y,
+  int16_t value,
+  int16_t maxValue,
+  bool hasTarget,
+  const String &suffix = "") {
+  drawGaugeCore(
+    x,
+    y,
+    value,
+    maxValue,
+    TFT_RED,
+    hasTarget,
+    suffix == "" ? "" : String(value) + suffix);
+}
 // ============================================================
 //  GAUGE DRAW (UPDATED GRID LAYOUT & VALUE TRACKING)
 // ============================================================
 void handleGauge(uint8_t whichGauge, int16_t gaugeValue) {
-  float temp;
-  uint16_t theMove;
-
-  // Set common text rendering options before the switch-case to clean up code
-  tft.loadFont(AA_FONT_SMALL, LittleFS); // Optional: if using smooth fonts for gauges
-  tft.setTextDatum(MC_DATUM);            // Force strict center-middle alignment
-  tft.setTextPadding(38);                // ── AUTOWIPE CONTAINER (Covers the inner circle)
-
   switch (whichGauge) {
-    case nozzleGauge: // Nozzle 1
-      temp = (float(gaugeValue) / maxNozzleTemps[0]);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(N1_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N1_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((nozzleTargets[0] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), N1_X, NOZ_ROW_Y - 2); 
+
+    case nozzleGauge:
+      drawTempGauge(N1_X, NOZ_ROW_Y, gaugeValue, maxNozzleTemps[0], nozzleTargets[0] != 0);
       break;
 
-    case progressGauge: // Progress Ring
-      if (gaugeValue < 0) gaugeValue = 0;
-      if (gaugeValue > 100) gaugeValue = 100;
-      temp = (float(gaugeValue) / 100.0);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (theMove > 40) tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue) + "%", PROG_X, TOP_ROW_Y - 2);
+    case nozzle2Gauge:
+      drawTempGauge(N2_X, NOZ_ROW_Y, gaugeValue, maxNozzleTemps[1], nozzleTargets[1] != 0);
       break;
 
-    case bedGauge: // Heated Bed
-      temp = (float(gaugeValue) / maxBedTemp);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(BED_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(BED_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((bedTarget != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), BED_X, TOP_ROW_Y - 2);
+    case nozzle3Gauge:
+      drawTempGauge(N3_X, NOZ_ROW_Y, gaugeValue, maxNozzleTemps[2], nozzleTargets[2] != 0);
       break;
 
-    case nozzle2Gauge: // Nozzle 2
-      temp = (float(gaugeValue) / maxNozzleTemps[1]);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(N2_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N2_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((nozzleTargets[1] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), N2_X, NOZ_ROW_Y - 2);
+    case nozzle4Gauge:
+      drawTempGauge(N4_X, NOZ_ROW_Y, gaugeValue, maxNozzleTemps[3], nozzleTargets[3] != 0);
       break;
 
-    case nozzle3Gauge: // Nozzle 3
-      temp = (float(gaugeValue) / maxNozzleTemps[2]);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(N3_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N3_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((nozzleTargets[2] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), N3_X, NOZ_ROW_Y - 2);
+    case bedGauge:
+      drawTempGauge(BED_X, BED_Y, gaugeValue, maxBedTemp, bedTarget != 0);
       break;
 
-    case nozzle4Gauge: // Nozzle 4
-      temp = (float(gaugeValue) / maxNozzleTemps[3]);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(N4_X, NOZ_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(N4_X, NOZ_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((nozzleTargets[3] != 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue), N4_X, NOZ_ROW_Y - 2);
+    case progressGauge:
+      drawGaugeCore(
+        PROG_X,
+        PROG_Y,
+        constrain(gaugeValue, 0, 100),
+        100,
+        TFT_WHITE,
+        false,
+        "",
+        true  // show percent
+      );
       break;
 
-    case 7: // Cavity / Chamber Ambient Gauge
-      if (gaugeValue < 0) gaugeValue = 0;
-      if (gaugeValue > 100) gaugeValue = 100;
-      temp = (float(gaugeValue) / 100.0);
-      theMove = (temp * 280) + 40;
-      tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      if (gaugeValue > 0 && theMove > 40) tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, theMove, TFT_GREEN, TFT_DARKGREY, false);
-      
-      // ── REMOVED fillCircle ──
-      tft.setTextColor((chamberTarget > 0) ? TFT_RED : TFT_WHITE, TFT_BLACK);
-      tft.drawString(String(gaugeValue) + "C", CHMBR_X, TOP_ROW_Y - 2);
+    case 7:  // Chamber
+      drawGaugeCore(
+        CHMBR_X,
+        TOP_ROW_Y,
+        constrain(gaugeValue, 0, 100),
+        100,
+        TFT_RED,
+        chamberTarget > 0,
+        String(gaugeValue) + "C");
       break;
   }
-
-  tft.setTextPadding(0); // Reset padding block allocation
-  tft.unloadFont();      // Close font driver cleanly
 }
 
 // ============================================================
@@ -526,6 +542,31 @@ void setRGB(bool redLevel, bool blueLevel, bool greenLevel) {
   digitalWrite(GREEN_PIN, !greenLevel);
   digitalWrite(BLUE_PIN, !blueLevel);
 }
+
+// ============================================================
+//  Test for changes
+// ============================================================
+bool hasChanged(uint16_t current, uint16_t &last) {
+  if (current != last) {
+    last = current;
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
+//  Set up for drawing
+// ============================================================
+void invalidateAllGauges() {
+  lastProgress = 999;
+  lastBedTemp = 999;
+  lastChamberTemp = 999;
+
+  for (int i = 0; i < 4; i++) {
+    lastNozzleTemps[i] = 999;
+  }
+}
+
 
 // ============================================================
 //  PRINTER OFFLINE SCREEN
@@ -593,7 +634,7 @@ void handleHostName() {
       }
     }
     http.end();
-  //  setRGB(1, 0, 0);
+    //  setRGB(1, 0, 0);
 
     if (printerName != "") {
       setRGB(0, 1, 0);
@@ -602,6 +643,10 @@ void handleHostName() {
 
       // Set all nozzle history tracking limits to out-of-bounds variables
       // to instantly trip the drawing functions on the very first update loop
+
+      lastProgress = 999;
+      lastBedTemp = 999;
+      lastChamberTemp = 999;
       for (int i = 0; i < 4; i++) {
         lastNozzleTemps[i] = 999;
       }
@@ -671,6 +716,8 @@ bool fetchPrinterData() {
   return true;
 }
 
+
+
 // ============================================================
 //  FETCH PRINTER TEMP LIMITS FROM KLIPPER CONFIG
 // ============================================================
@@ -709,30 +756,30 @@ void handleTimeUsed() {
   int mins = (totalSecs % 3600) / 60;
 
   // ── TARGETED ONCE-ONLY DRAWS ──
-  // These clear boxes are perfectly fine here because handleTimeUsed only executes 
+  // These clear boxes are perfectly fine here because handleTimeUsed only executes
   // ONCE at the exact moment the print drops into complete state.
-  tft.fillRect(0, 385, SCREEN_W - 1, 30, TFT_BLACK);   
-  tft.fillRect(0, filenameY - 15, SCREEN_W - 1, 30, TFT_BLACK); 
+  tft.fillRect(0, 385, SCREEN_W - 1, 30, TFT_BLACK);
+  tft.fillRect(0, filenameY - 15, SCREEN_W - 1, 30, TFT_BLACK);
 
   drawBmp(LittleFS, SUCCESS_IMAGE, graphicX, graphicY);
 
   tft.loadFont(AA_FONT_SMALL, LittleFS);
-  tft.setTextDatum(MC_DATUM); 
-  tft.setTextPadding(SCREEN_W - 10); // Safe stable background container
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextPadding(SCREEN_W - 10);  // Safe stable background container
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  
+
   if (hrs != 0) {
     sprintf(buffer, "%s: %1u:%02u %s", strTotal, hrs, mins, strHrs);
   } else {
     sprintf(buffer, "%s: %u %s", strTotal, mins, strMins);
   }
-  
-  tft.drawString(buffer, SCREEN_W / 2, 405); 
-  
+
+  tft.drawString(buffer, SCREEN_W / 2, 405);
+
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString(thePrintFile, SCREEN_W / 2, filenameY); 
-  
-  tft.setTextPadding(0); 
+  tft.drawString(thePrintFile, SCREEN_W / 2, filenameY);
+
+  tft.setTextPadding(0);
   tft.unloadFont();
 
   justFinished = true;
@@ -857,16 +904,6 @@ void updatePrinterDisplay(PrinterState state) {
     justFinished = false;
   }
 
-  // Always update temperature gauges (Original Core Structure)
-  if (round(nozzleTemp) != lastNozzleTemp) {
-    lastNozzleTemp = round(nozzleTemp);
-    handleGauge(nozzleGauge, lastNozzleTemp);
-  }
-  if (round(bedTemp) != lastBedTemp) {
-    lastBedTemp = round(bedTemp);
-    handleGauge(bedGauge, lastBedTemp);
-  }
-
   switch (state) {
     case STATE_IDLE:
       tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
@@ -892,12 +929,9 @@ void updatePrinterDisplay(PrinterState state) {
       break;
 
     case STATE_PREP:
-      tft.drawSmoothArc(PROG_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.fillCircle(PROG_X, TOP_ROW_Y, 20, TFT_BLACK);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString(strPrep, PROG_X, TOP_ROW_Y, 2);
 
       if (!showIdle) {
+        invalidateAllGauges();
         tft.fillRect(graphicX, graphicY, 110, 110, TFT_BLACK);
         drawBmp(LittleFS, HEATING_IMAGE, graphicX + 7, graphicY + 7);
         showIdle = true;
@@ -908,10 +942,18 @@ void updatePrinterDisplay(PrinterState state) {
     case STATE_PRINTING:
       showIdle = false;
       justFinished = false;
-
+      invalidateAllGauges();
       // Runs once when an edge trigger signals a brand new print initialization frame
       if (thePrintFile != "" && (lastState != STATE_PRINTING || forcePoll)) {
         ntfyResetForNewPrint();
+        // Force ALL gauges to redraw on first PRINTING frame
+        lastProgress = 999;
+        lastBedTemp = 999;
+        lastChamberTemp = 999;
+
+        for (int i = 0; i < 4; i++) {
+          lastNozzleTemps[i] = 999;
+        }
 
         // Clear the entire lower layout quadrant once at start (Y=250 down to bottom)
         tft.fillRect(0, statusZoneY, SCREEN_W - 1, SCREEN_H - statusZoneY, TFT_BLACK);
@@ -936,7 +978,7 @@ void updatePrinterDisplay(PrinterState state) {
         } else if (thumbBuffer != NULL) {
           fetchAndDrawThumbnail();
         }
-
+        invalidateAllGauges();
         // This executes your newly aligned text and centers everything dynamically
         handleETA();
       }
@@ -947,7 +989,7 @@ void updatePrinterDisplay(PrinterState state) {
     case STATE_COMPLETE:
       lastProgress = 0;
       handleGauge(progressGauge, 0);
-
+      invalidateAllGauges();
       if (thePrintFile != "") {
         ntfyPrintComplete(thePrintFileRaw, savedTotalDuration);  // Send alert push
         tft.fillRect(0, filenameY - 14, 239, 16, TFT_BLACK);
@@ -978,27 +1020,42 @@ void handlePrinterStatus() {
     // Pass down core telemetry blocks to updatePrinterDisplay
     updatePrinterDisplay(currentState);
 
-    // ── Unified 3-Over-4 Layout Rendering Pipeline ──
-    // Bottom Row (Nozzles)
-    handleGauge(nozzleGauge, round(nozzleTemps[0]));
-    handleGauge(nozzle2Gauge, round(nozzleTemps[1]));
-    handleGauge(nozzle3Gauge, round(nozzleTemps[2]));
-    handleGauge(nozzle4Gauge, round(nozzleTemps[3]));
-
-    // Top Row (Bed and Progress)
-    handleGauge(bedGauge, round(bedTemp));
-    uint16_t currentProgressInt = (uint16_t)(progress * 100.0);
-    handleGauge(progressGauge, currentProgressInt);
-
-    // Top Row (Chamber/Cavity Gauge) - Active across Standby, Prep, and Printing
-    if (hasChamber) {
-      handleGauge(7, round(chamberTemp));  // Calls ID 7 to draw the third upper circle
-    } else {
-      // Clear the right column space with a gray blank ring if Klipper connection drops
-      tft.drawSmoothArc(CHMBR_X, TOP_ROW_Y, 32, 22, 40, 320, TFT_DARKGREY, TFT_BLACK, false);
-      tft.fillCircle(CHMBR_X, TOP_ROW_Y, 20, TFT_BLACK);
+    uint16_t currentNozzle[4];
+    for (int i = 0; i < 4; i++) {
+      currentNozzle[i] = round(nozzleTemps[i]);
     }
 
+    // Nozzles
+    if (hasChanged(currentNozzle[0], lastNozzleTemps[0])) {
+      handleGauge(nozzleGauge, currentNozzle[0]);
+    }
+    if (hasChanged(currentNozzle[1], lastNozzleTemps[1])) {
+      handleGauge(nozzle2Gauge, currentNozzle[1]);
+    }
+    if (hasChanged(currentNozzle[2], lastNozzleTemps[2])) {
+      handleGauge(nozzle3Gauge, currentNozzle[2]);
+    }
+    if (hasChanged(currentNozzle[3], lastNozzleTemps[3])) {
+      handleGauge(nozzle4Gauge, currentNozzle[3]);
+    }
+
+    // Bed
+    uint16_t currentBed = round(bedTemp);
+    if (hasChanged(currentBed, lastBedTemp)) {
+      handleGauge(bedGauge, currentBed);
+    }
+
+    // Progress
+    uint16_t currentProgressInt = (uint16_t)(progress * 100.0);
+    if (hasChanged(currentProgressInt, lastProgress)) {
+      handleGauge(progressGauge, currentProgressInt);
+    }
+
+    // Top Row (Chamber/Cavity Gauge) - Active across Standby, Prep, and Printing
+    uint16_t currentChamber = round(chamberTemp);
+    if (hasChanged(currentChamber, lastChamberTemp)) {
+      handleGauge(7, currentChamber);
+    }
   } else {
     printerName = "";
     handlePrinterOffLine();
@@ -1186,10 +1243,7 @@ void handlePrinterUpdate() {
     lastState = STATE_PRINTING;
   }
 
-  for (int i = 0; i < 4; i++) {
-    lastNozzleTemps[i] = 999;
-  }
-
+  invalidateAllGauges();
   forcePoll = true;
   server.send(200, "text/html", SendHTML());
 }
